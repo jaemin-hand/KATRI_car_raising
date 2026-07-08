@@ -113,9 +113,10 @@ class MainActivity : Activity() {
     private var btnStartPause: Button? = null
     private var btnStop: Button? = null
 
-    private var selectedVehicle = "Vehicle A"
-    private var selectedTestMode = "9000km High-speed loop"
+    private var selectedVehicle = "차량 A"
+    private var selectedTestMode = "9000km 고주로 주행"
     private var selectedStartOdo = ""
+    private var selectedTrackOdo = ""
 
     private val targetDistanceKm = 9000.0
     private val lapDistanceM = 5_000.0
@@ -123,12 +124,27 @@ class MainActivity : Activity() {
     private val redFlashIntervalM = 5_000.0
     private val startGateRadiusM = 45.0
     private val routePointMinSpacingM = 3.0
+    private val stationaryDistanceM = 4.0
+    private val minimumMovingSpeedKmh = 0.8
+    private val lowSpeedGpsJitterKmh = 12.0
+    private val minSpeedSampleSeconds = 0.5
+    private val maxLocationAccuracyM = 25f
+    private val maxSpeedAccuracyMps = 1.5f
+    private val speedSmoothingAlpha = 0.35
+    private val staleSpeedTimeoutMs = 3_500L
     private val referenceRouteToleranceM = 120.0
     private val referenceRouteMinPoints = 80
     private val referenceRouteMinDistanceM = 4_000.0
     private val maxCurrentRoutePoints = 5_000
     private val referenceRoutePrefsKey = "reference_route_points"
     private var lastRedFlashDistanceBucket = 0
+    private var isRedFlashLoopActive = false
+
+    private val redFlashLoopRunnable = object : Runnable {
+        override fun run() {
+            runRedFlashPulse()
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -150,6 +166,7 @@ class MainActivity : Activity() {
     override fun onPause() {
         super.onPause()
         uiHandler.removeCallbacks(uiUpdateRunnable)
+        stopRedFlashLoop()
         stopLocationUpdates()
     }
 
@@ -212,7 +229,7 @@ class MainActivity : Activity() {
             action?.invoke()
             startLocationUpdates()
         } else {
-            Toast.makeText(this, "Location permission is required.", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "위치 권한이 필요합니다.", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -225,7 +242,7 @@ class MainActivity : Activity() {
             else -> ""
         }
         if (provider.isEmpty()) {
-            Toast.makeText(this, "No GPS/network provider is enabled.", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "GPS 또는 네트워크 위치가 꺼져 있습니다.", Toast.LENGTH_SHORT).show()
             return
         }
 
@@ -248,10 +265,11 @@ class MainActivity : Activity() {
             val dtMs = max(1L, nowMs - previousLocationUpdateMs)
             val deltaM = prev.distanceTo(location).coerceAtLeast(0f).toDouble()
             val dtSec = dtMs / 1000.0
-            currentSpeedKmh = if (dtSec > 0.05 && deltaM > 0) deltaM / dtSec * 3.6 else if (location.hasSpeed()) location.speed * 3.6 else 0.0
+            currentSpeedKmh = smoothSpeedKmh(calculateRawSpeedKmh(prev, location, dtSec, deltaM))
+            val acceptedDeltaM = if (shouldAcceptMovement(location, deltaM, currentSpeedKmh)) deltaM else 0.0
 
-            if (sessionState == SessionState.Running && deltaM > 0.2) {
-                totalDistanceM += deltaM
+            if (sessionState == SessionState.Running && acceptedDeltaM > 0.0) {
+                totalDistanceM += acceptedDeltaM
                 triggerRedFlashIfNeeded()
                 appendCurrentRoutePoint(location)
                 evaluateLap(location)
@@ -267,7 +285,7 @@ class MainActivity : Activity() {
             previousLocationUpdateMs = nowMs
         } else {
             previousLocationUpdateMs = nowMs
-            currentSpeedKmh = if (location.hasSpeed()) location.speed * 3.6 else 0.0
+            currentSpeedKmh = smoothSpeedKmh(calculateRawSpeedKmh(null, location, 0.0, 0.0))
         }
 
         previousLocation = prev ?: location
@@ -275,18 +293,90 @@ class MainActivity : Activity() {
         if (startLineLocation != null && sessionState != SessionState.Idle) {
             updateTrackAreaState(location)
         }
+        if (sessionState != SessionState.Running || currentSpeedKmh <= 0.0) {
+            stopRedFlashLoop()
+        }
         updateTrackUi()
+    }
+
+    private fun calculateRawSpeedKmh(prev: Location?, location: Location, dtSec: Double, deltaM: Double): Double {
+        if (!isUsableLocation(location)) return 0.0
+
+        val hasTrustedGpsSpeed = isTrustedGpsSpeed(location)
+        val gpsSpeedKmh = if (hasTrustedGpsSpeed) {
+            location.speed.toDouble() * 3.6
+        } else {
+            null
+        }
+        val distanceSpeedKmh = if (
+            prev != null &&
+            isUsableLocation(prev) &&
+            dtSec >= minSpeedSampleSeconds &&
+            deltaM >= stationaryDistanceM
+        ) {
+            deltaM / dtSec * 3.6
+        } else {
+            null
+        }
+
+        val rawSpeedKmh = gpsSpeedKmh ?: distanceSpeedKmh ?: 0.0
+        if (!hasTrustedGpsSpeed && prev != null && deltaM < stationaryDistanceM && rawSpeedKmh < lowSpeedGpsJitterKmh) return 0.0
+        return if (rawSpeedKmh < minimumMovingSpeedKmh) 0.0 else rawSpeedKmh
+    }
+
+    private fun smoothSpeedKmh(rawSpeedKmh: Double): Double {
+        if (rawSpeedKmh <= 0.0) return 0.0
+        if (currentSpeedKmh <= 0.0) return rawSpeedKmh
+        return currentSpeedKmh * (1.0 - speedSmoothingAlpha) + rawSpeedKmh * speedSmoothingAlpha
+    }
+
+    private fun shouldAcceptMovement(location: Location, deltaM: Double, speedKmh: Double): Boolean {
+        val trustedGpsMovement = isTrustedGpsSpeed(location) && deltaM >= 0.5
+        return isUsableLocation(location) &&
+            speedKmh >= minimumMovingSpeedKmh &&
+            (deltaM >= stationaryDistanceM || trustedGpsMovement)
+    }
+
+    private fun isUsableLocation(location: Location): Boolean {
+        return !location.hasAccuracy() || location.accuracy <= maxLocationAccuracyM
+    }
+
+    private fun isTrustedGpsSpeed(location: Location): Boolean {
+        if (location.provider != LocationManager.GPS_PROVIDER) return false
+        if (!location.hasSpeed()) return false
+        if (!isUsableLocation(location)) return false
+        return !location.hasSpeedAccuracy() || location.speedAccuracyMetersPerSecond <= maxSpeedAccuracyMps
     }
 
     private fun triggerRedFlashIfNeeded() {
         val bucket = (totalDistanceM / redFlashIntervalM).toInt()
         if (bucket <= 0 || bucket <= lastRedFlashDistanceBucket) return
         lastRedFlashDistanceBucket = bucket
-        triggerRedFlash()
+        startRedFlashLoop()
     }
 
-    private fun triggerRedFlash() {
-        val overlay = redFlashOverlay ?: return
+    private fun startRedFlashLoop() {
+        if (redFlashOverlay == null) return
+        if (isRedFlashLoopActive) return
+        isRedFlashLoopActive = true
+        uiHandler.removeCallbacks(redFlashLoopRunnable)
+        redFlashLoopRunnable.run()
+    }
+
+    private fun stopRedFlashLoop() {
+        isRedFlashLoopActive = false
+        uiHandler.removeCallbacks(redFlashLoopRunnable)
+        redFlashOverlay?.animate()?.cancel()
+        redFlashOverlay?.alpha = 0f
+        redFlashOverlay?.visibility = View.GONE
+    }
+
+    private fun runRedFlashPulse() {
+        if (!isRedFlashLoopActive) return
+        val overlay = redFlashOverlay ?: run {
+            isRedFlashLoopActive = false
+            return
+        }
         overlay.animate().cancel()
         overlay.alpha = 0f
         overlay.visibility = View.VISIBLE
@@ -297,7 +387,10 @@ class MainActivity : Activity() {
                 overlay.animate()
                     .alpha(0f)
                     .setDuration(520L)
-                    .withEndAction { overlay.visibility = View.GONE }
+                    .withEndAction {
+                        overlay.visibility = View.GONE
+                        if (isRedFlashLoopActive) uiHandler.postDelayed(redFlashLoopRunnable, 180L)
+                    }
                     .start()
             }
             .start()
@@ -355,7 +448,7 @@ class MainActivity : Activity() {
         referenceRoutePoints.addAll(currentRoutePoints)
         hasReferenceRoute = true
         saveReferenceRoute()
-        Toast.makeText(this, "Reference route saved.", Toast.LENGTH_SHORT).show()
+        Toast.makeText(this, "기준 주행 경로가 저장되었습니다.", Toast.LENGTH_SHORT).show()
     }
 
     private fun loadReferenceRoute() {
@@ -424,7 +517,7 @@ class MainActivity : Activity() {
 
     private fun targetDistanceKmForCurrentMode(): Double {
         return when (selectedTestMode) {
-            "Short run" -> 5.0
+            "단거리 주행" -> 5.0
             else -> targetDistanceKm
         }
     }
@@ -439,14 +532,15 @@ class MainActivity : Activity() {
     }
 
     private fun currentStatusLabel(): String = when (sessionState) {
-        SessionState.Idle -> "Status: Ready"
-        SessionState.Ready -> "Status: Ready"
-        SessionState.Running -> "Status: Running"
-        SessionState.Paused -> "Status: Paused"
-        SessionState.Finished -> "Status: Finished"
+        SessionState.Idle -> "상태: 대기"
+        SessionState.Ready -> "상태: 대기"
+        SessionState.Running -> "상태: 주행 중"
+        SessionState.Paused -> "상태: 일시정지"
+        SessionState.Finished -> "상태: 종료"
     }
 
     private fun showHome() {
+        stopRedFlashLoop()
         currentScreen = Screen.Home
         setContentView(createHomeView())
     }
@@ -479,7 +573,7 @@ class MainActivity : Activity() {
             gravity = Gravity.CENTER
         }
         val subtitle = TextView(this).apply {
-            text = "Distance / speed / lap"
+            text = "거리 / 속도 / 랩 카운트"
             textSize = 15f
             setTextColor(ScreenColors.MutedText)
             gravity = Gravity.CENTER
@@ -500,7 +594,7 @@ class MainActivity : Activity() {
 
     private fun createPreparationView(): LinearLayout {
         val root = screenRoot()
-        root.addView(toolbar("시험 준비", "Vehicle + test mode"))
+        root.addView(toolbar("시험 준비", "차량 및 시험 방식"))
 
         val scroll = ScrollView(this)
         val content = LinearLayout(this).apply {
@@ -508,30 +602,31 @@ class MainActivity : Activity() {
             setPadding(dp(16), dp(14), dp(16), dp(24))
         }
 
-        content.addView(sectionTitle("Vehicle / Test"))
-        content.addView(formLabel("Vehicle"))
-        content.addView(spinnerOf("Vehicle", "Vehicle A", "Vehicle B", "Vehicle C") { selectedVehicle = it })
-        content.addView(formLabel("Test mode"))
+        content.addView(sectionTitle("차량 / 시험"))
+        content.addView(formLabel("차량"))
+        content.addView(spinnerOf("차량", "차량 A", "차량 B", "차량 C") { selectedVehicle = it })
+        content.addView(formLabel("시험 방식"))
         content.addView(
-            spinnerOf("Test mode", "9000km High-speed loop", "Short run", "Custom") {
+            spinnerOf("시험 방식", "9000km 고주로 주행", "단거리 주행", "사용자 설정") {
                 selectedTestMode = it
             }
         )
-        content.addView(formLabel("Start ODO"))
+        content.addView(formLabel("시작 ODO"))
         val startOdoInput = numberInput("ODO (km)")
+        if (selectedStartOdo.isNotEmpty()) startOdoInput.setText(selectedStartOdo)
         startOdoInput.setOnFocusChangeListener { _, hasFocus ->
             if (!hasFocus) selectedStartOdo = startOdoInput.text.toString().trim()
         }
         content.addView(startOdoInput)
-        content.addView(formLabel("Checklist"))
+        content.addView(formLabel("체크리스트"))
 
-        val summary = summaryText("Done: 0/${preparationItems().count { it.required }} required")
+        val summary = summaryText("완료: 0/${preparationItems().count { it.required }} 필수")
         content.addView(summary)
         val checks = mutableListOf<Pair<CheckBox, PrepItem>>()
         val updateSummary = {
             val required = checks.filter { it.second.required }
             val done = required.count { it.first.isChecked }
-            summary.text = "Done: $done/${required.size} required"
+            summary.text = "완료: $done/${required.size} 필수"
         }
         preparationItems().forEach { item ->
             val row = preparationItemRow(item, updateSummary)
@@ -539,13 +634,14 @@ class MainActivity : Activity() {
             content.addView(row.second)
         }
 
-        content.addView(sectionTitle("Go"))
+        content.addView(sectionTitle("이동"))
         content.addView(
-            primaryButton("Move to High-speed Track") {
+            primaryButton("고주로 주행 화면으로 이동") {
                 selectedStartOdo = startOdoInput.text.toString().trim()
+                if (selectedTrackOdo.isEmpty()) selectedTrackOdo = selectedStartOdo
                 val remaining = checks.count { it.second.required && !it.first.isChecked }
                 if (remaining > 0) {
-                    Toast.makeText(this, "Complete required checklist first. ($remaining remaining)", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this, "필수 체크리스트를 먼저 완료하세요. (${remaining}개 남음)", Toast.LENGTH_SHORT).show()
                     return@primaryButton
                 }
                 showTrack()
@@ -574,7 +670,7 @@ class MainActivity : Activity() {
         previewView = TrackPreviewView(this).also { view ->
             content.addView(view, fullWidthHeight(dp(230)))
         }
-        content.addView(sectionTitle("Measurement"))
+        content.addView(sectionTitle("측정"))
 
         tvSpeed = metricTextView("0.0 km/h")
         tvDistance = metricTextView("0.00 km")
@@ -583,29 +679,52 @@ class MainActivity : Activity() {
         tvRemain = metricTextView("${targetDistanceKmForCurrentMode()} / 0.0 km")
         tvElapsed = metricTextView("00:00:00")
         tvStatus = metricTextView(currentStatusLabel())
-        tvBoundary = metricTextView("Track: Checking")
-        tvStartLine = metricTextView("Start line: Not set")
+        tvBoundary = metricTextView("고주로: 확인 중")
+        tvStartLine = metricTextView("스타트라인: 미설정")
 
-        content.addView(metricRow(metricCard("Speed", tvSpeed!!), metricCard("Total distance", tvDistance!!)))
-        content.addView(metricRow(metricCard("Lap count", tvLap!!), metricCard("Lap distance", tvLapProgress!!)))
-        content.addView(metricRow(metricCard("Elapsed", tvElapsed!!), metricCard("Remaining", tvRemain!!)))
+        content.addView(metricRow(metricCard("속도", tvSpeed!!), metricCard("총 주행거리", tvDistance!!)))
+        content.addView(metricRow(metricCard("랩 수", tvLap!!), metricCard("랩 거리", tvLapProgress!!)))
+        content.addView(metricRow(metricCard("경과시간", tvElapsed!!), metricCard("남은 거리", tvRemain!!)))
         content.addView(tvStatus)
         content.addView(space(dp(6)))
         content.addView(tvBoundary)
         content.addView(tvStartLine)
         content.addView(space(dp(10)))
 
-        btnSetStartLine = secondaryButton("Set start line at current location") {
+        content.addView(sectionTitle("ODO"))
+        content.addView(formLabel("현재 ODO"))
+        val trackOdoInput = numberInput("ODO (km)")
+        val initialTrackOdo = selectedTrackOdo.ifEmpty { selectedStartOdo }
+        val trackOdoSavedText = summaryText(savedOdoLabel(initialTrackOdo))
+        if (initialTrackOdo.isNotEmpty()) {
+            trackOdoInput.setText(initialTrackOdo)
+            trackOdoInput.setSelection(trackOdoInput.text.length)
+        }
+        val trackOdoRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(trackOdoInput, LinearLayout.LayoutParams(0, dp(52), 1f).apply { rightMargin = dp(8) })
+            addView(secondaryButton("확인") {
+                selectedTrackOdo = trackOdoInput.text.toString().trim()
+                trackOdoSavedText.text = savedOdoLabel(selectedTrackOdo)
+                Toast.makeText(this@MainActivity, "ODO가 저장되었습니다.", Toast.LENGTH_SHORT).show()
+            }, LinearLayout.LayoutParams(dp(112), dp(52)))
+        }
+        content.addView(trackOdoRow)
+        content.addView(trackOdoSavedText)
+        content.addView(space(dp(10)))
+
+        btnSetStartLine = secondaryButton("현재 위치를 스타트라인으로 설정") {
             requestLocationPermission { setStartLine() }
         }
-        btnStartPause = primaryButton("Start run") {
+        btnStartPause = primaryButton("주행 시작") {
             when (sessionState) {
                 SessionState.Idle, SessionState.Ready, SessionState.Finished -> startSession()
                 SessionState.Running -> pauseSession()
                 SessionState.Paused -> resumeSession()
             }
         }
-        btnStop = secondaryButton("Stop session") {
+        btnStop = secondaryButton("시험 종료") {
             if (sessionState == SessionState.Finished) {
                 resetToReady()
             } else {
@@ -638,28 +757,28 @@ class MainActivity : Activity() {
     }
 
     private fun preparationItems(): List<PrepItem> = listOf(
-        PrepItem("Front photo", "Capture front side"),
-        PrepItem("Rear photo", "Capture rear side"),
-        PrepItem("Left side", "Capture left side"),
-        PrepItem("Right side", "Capture right side"),
-        PrepItem("Tire pressure", "Enter tire pressure", skippable = true),
-        PrepItem("Tread depth", "Measure tread depth"),
-        PrepItem("Start ODO", "Enter start ODO"),
-        PrepItem("Vehicle label", "Capture vehicle specification label"),
-        PrepItem("Tire info", "Capture tire maker/spec", skippable = true),
-        PrepItem("Engine bay 1", "Capture engine bay photo"),
-        PrepItem("Engine bay 2", "Capture engine bay photo"),
-        PrepItem("VBOX/GPS mounting", "Confirm VBOX/GPS mount", skippable = true),
-        PrepItem("Underbody front", "Capture front underbody"),
-        PrepItem("Underbody rear", "Capture rear underbody"),
-        PrepItem("FR LH Low Control Arm", "Capture FR LH Low Control Arm", required = false, skippable = true),
-        PrepItem("FR RH Low Control Arm", "Capture FR RH Low Control Arm", required = false, skippable = true),
-        PrepItem("RR LH Low Control Arm", "Capture RR LH Low Control Arm", required = false, skippable = true),
-        PrepItem("RR RH Low Control Arm", "Capture RR RH Low Control Arm", required = false, skippable = true),
-        PrepItem("Tire swap for uneven wear", "Track tire position exchange by car type", required = false, skippable = true),
-        PrepItem("End ODO", "Input end ODO", required = false),
-        PrepItem("End underbody check", "Capture underbody and tire return", required = false),
-        PrepItem("Incident photo", "Capture optional event photo when needed", required = false, skippable = true)
+        PrepItem("전면 사진", "차량 전면 촬영"),
+        PrepItem("후면 사진", "차량 후면 촬영"),
+        PrepItem("좌측면 사진", "차량 좌측면 촬영"),
+        PrepItem("우측면 사진", "차량 우측면 촬영"),
+        PrepItem("타이어 공기압", "타이어 공기압 입력", skippable = true),
+        PrepItem("트레드 깊이", "타이어 트레드 깊이 측정"),
+        PrepItem("시작 ODO", "시작 ODO 입력"),
+        PrepItem("차량 제원 라벨", "차량 제원 라벨 촬영"),
+        PrepItem("타이어 정보", "타이어 제조사 및 제원 촬영", skippable = true),
+        PrepItem("엔진룸 1", "엔진룸 사진 촬영"),
+        PrepItem("엔진룸 2", "엔진룸 사진 촬영"),
+        PrepItem("VBOX/GPS 장착", "VBOX/GPS 장착 상태 확인", skippable = true),
+        PrepItem("하부 전단", "차량 하부 전단 촬영"),
+        PrepItem("하부 후단", "차량 하부 후단 촬영"),
+        PrepItem("FR LH 로어 컨트롤 암", "전륜 좌측 로어 컨트롤 암 촬영", required = false, skippable = true),
+        PrepItem("FR RH 로어 컨트롤 암", "전륜 우측 로어 컨트롤 암 촬영", required = false, skippable = true),
+        PrepItem("RR LH 로어 컨트롤 암", "후륜 좌측 로어 컨트롤 암 촬영", required = false, skippable = true),
+        PrepItem("RR RH 로어 컨트롤 암", "후륜 우측 로어 컨트롤 암 촬영", required = false, skippable = true),
+        PrepItem("타이어 위치교환", "편마모 확인용 타이어 위치교환 기록", required = false, skippable = true),
+        PrepItem("종료 ODO", "종료 ODO 입력", required = false),
+        PrepItem("종료 하부 확인", "하부 및 타이어 원위치 촬영", required = false),
+        PrepItem("이벤트 사진", "이벤트 발생 시 추가 사진 촬영", required = false, skippable = true)
     )
 
     private fun preparationItemRow(item: PrepItem, updateSummary: () -> Unit): Pair<CheckBox, LinearLayout> {
@@ -694,15 +813,15 @@ class MainActivity : Activity() {
             gravity = Gravity.END
             setPadding(0, dp(8), 0, 0)
         }
-        actions.addView(statusBadge(if (item.required) "Required" else "Optional"))
-        actions.addView(compactButton("Done") {
+        actions.addView(statusBadge(if (item.required) "필수" else "선택"))
+        actions.addView(compactButton("완료") {
             check.isChecked = true
-            Toast.makeText(this@MainActivity, "${item.title} done", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this@MainActivity, "${item.title} 완료", Toast.LENGTH_SHORT).show()
         })
         if (item.skippable) {
-            actions.addView(compactButton("Skip") {
+            actions.addView(compactButton("스킵") {
                 check.isChecked = true
-                Toast.makeText(this@MainActivity, "${item.title} skipped", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this@MainActivity, "${item.title} 스킵", Toast.LENGTH_SHORT).show()
             })
         }
         row.addView(actions)
@@ -711,15 +830,17 @@ class MainActivity : Activity() {
 
     private fun startSession() {
         if (startLineLocation == null) {
-            Toast.makeText(this, "Set start line first.", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "스타트라인을 먼저 설정하세요.", Toast.LENGTH_SHORT).show()
             return
         }
         if (sessionState == SessionState.Idle || sessionState == SessionState.Finished) {
+            stopRedFlashLoop()
             totalDistanceM = 0.0
             lapCount = 0
             lapStartDistanceM = 0.0
             lastGateDistanceM = 0.0
             lastRedFlashDistanceBucket = 0
+            currentSpeedKmh = 0.0
             sessionStartRealtimeMs = SystemClock.elapsedRealtime()
             sessionPausedAccumMs = 0L
             sessionPausedAtMs = 0L
@@ -744,6 +865,8 @@ class MainActivity : Activity() {
         if (sessionState != SessionState.Running) return
         sessionState = SessionState.Paused
         sessionPausedAtMs = SystemClock.elapsedRealtime()
+        currentSpeedKmh = 0.0
+        stopRedFlashLoop()
         updateControlButtons()
         tvStatus?.text = currentStatusLabel()
         updateTrackUi()
@@ -763,10 +886,12 @@ class MainActivity : Activity() {
         if (sessionState == SessionState.Idle || sessionState == SessionState.Ready) return
         saveReferenceRouteIfReady()
         sessionState = SessionState.Finished
+        currentSpeedKmh = 0.0
+        stopRedFlashLoop()
         tvStatus?.text = currentStatusLabel()
         updateControlButtons()
         updateTrackUi()
-        Toast.makeText(this, "Session finished.", Toast.LENGTH_SHORT).show()
+        Toast.makeText(this, "주행 시험이 종료되었습니다.", Toast.LENGTH_SHORT).show()
     }
 
     private fun resetToReady() {
@@ -776,6 +901,8 @@ class MainActivity : Activity() {
         lastGateDistanceM = 0.0
         lastRedFlashDistanceBucket = 0
         wasInStartGate = false
+        currentSpeedKmh = 0.0
+        stopRedFlashLoop()
         currentRoutePoints.clear()
         sessionState = SessionState.Ready
         updateControlButtons()
@@ -787,7 +914,7 @@ class MainActivity : Activity() {
         requestLocationPermission {
             val now = currentLocation
             if (now == null) {
-                Toast.makeText(this, "Current location not available.", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, "현재 위치를 사용할 수 없습니다.", Toast.LENGTH_SHORT).show()
                 return@requestLocationPermission
             }
             startLineLocation = Location(now)
@@ -799,6 +926,7 @@ class MainActivity : Activity() {
             lastRedFlashDistanceBucket = 0
             wasInStartGate = true
             currentSpeedKmh = 0.0
+            stopRedFlashLoop()
             sessionStartRealtimeMs = 0L
             sessionPausedAccumMs = 0L
             sessionPausedAtMs = 0L
@@ -809,26 +937,37 @@ class MainActivity : Activity() {
                 isInTrack = true,
                 isRunning = false
             )
-            tvStartLine?.text = "Start line: Set"
+            tvStartLine?.text = "스타트라인: 설정됨"
             updateControlButtons()
             updateTrackUi()
-            Toast.makeText(this, "Start line set.", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "스타트라인이 설정되었습니다.", Toast.LENGTH_SHORT).show()
         }
     }
 
     private fun updateControlButtons() {
         val startLabel = when (sessionState) {
-            SessionState.Idle, SessionState.Ready, SessionState.Finished -> "Start run"
-            SessionState.Running -> "Pause"
-            SessionState.Paused -> "Resume"
+            SessionState.Idle, SessionState.Ready, SessionState.Finished -> "주행 시작"
+            SessionState.Running -> "일시정지"
+            SessionState.Paused -> "재개"
         }
         btnStartPause?.text = startLabel
-        btnStop?.text = if (sessionState == SessionState.Finished) "Reset" else "Stop"
+        btnStop?.text = if (sessionState == SessionState.Finished) "초기화" else "정지"
         btnSetStartLine?.isEnabled = sessionState != SessionState.Running
-        btnSetStartLine?.text = if (startLineLocation == null) "Set start line now" else "Reset start line"
+        btnSetStartLine?.text = if (startLineLocation == null) "현재 위치를 스타트라인으로 설정" else "스타트라인 재설정"
     }
 
     private fun updateTrackUi() {
+        if (
+            sessionState == SessionState.Running &&
+            previousLocationUpdateMs > 0L &&
+            SystemClock.elapsedRealtime() - previousLocationUpdateMs > staleSpeedTimeoutMs
+        ) {
+            currentSpeedKmh = 0.0
+        }
+        if (sessionState != SessionState.Running || currentSpeedKmh <= 0.0) {
+            stopRedFlashLoop()
+        }
+
         val location = currentLocation
         val totalDistanceKm = totalDistanceM / 1000.0
         val lapDistanceKm = max(0.0, totalDistanceM - lapStartDistanceM) / 1000.0
@@ -843,7 +982,7 @@ class MainActivity : Activity() {
         tvElapsed?.text = String.format(Locale.US, "%02d:%02d:%02d", elapsedSessionSeconds() / 3600, (elapsedSessionSeconds() % 3600) / 60, elapsedSessionSeconds() % 60)
         tvStatus?.text = currentStatusLabel()
         tvBoundary?.text = trackAreaLabel()
-        tvStartLine?.text = if (startLineLocation == null) "Start line: Not set" else "Start line: Set"
+        tvStartLine?.text = if (startLineLocation == null) "스타트라인: 미설정" else "스타트라인: 설정됨"
 
         if (location != null) {
             previewView?.setState(
@@ -858,10 +997,14 @@ class MainActivity : Activity() {
 
     private fun trackAreaLabel(): String {
         return when {
-            !hasReferenceRoute -> "Track area: learning reference route"
-            insideTrackArea -> "Track area: on reference route"
-            else -> "Track area: out of reference route"
+            !hasReferenceRoute -> "고주로: 기준 경로 학습 중"
+            insideTrackArea -> "고주로: 기준 경로 내"
+            else -> "고주로: 기준 경로 이탈"
         }
+    }
+
+    private fun savedOdoLabel(odo: String): String {
+        return if (odo.isBlank()) "저장 ODO: 미입력" else "저장 ODO: $odo km"
     }
 
     private fun spinnerOf(label: String, vararg items: String, onSelected: ((String) -> Unit)? = null): Spinner {
@@ -925,7 +1068,7 @@ class MainActivity : Activity() {
             setBackgroundColor(Color.WHITE)
             setPadding(dp(14), dp(12), dp(14), dp(12))
         }
-        bar.addView(secondaryButton("Back") { showHome() }, LinearLayout.LayoutParams(dp(80), dp(46)))
+        bar.addView(secondaryButton("뒤로") { showHome() }, LinearLayout.LayoutParams(dp(80), dp(46)))
         val texts = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(12), 0, 0, 0)
