@@ -33,9 +33,11 @@ import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import java.util.Locale
+import kotlin.math.atan2
 import kotlin.math.cos
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.sin
 import kotlin.math.sqrt
 
 private enum class Screen { Home, Preparation, Track }
@@ -524,9 +526,10 @@ class MainActivity : Activity() {
 
     private fun elapsedSessionSeconds(): Long {
         val now = SystemClock.elapsedRealtime()
+        if (sessionStartRealtimeMs <= 0L) return 0L
         return when (sessionState) {
-            SessionState.Running -> (now - sessionStartRealtimeMs - sessionPausedAccumMs) / 1000L
-            SessionState.Paused -> (sessionPausedAtMs - sessionStartRealtimeMs - sessionPausedAccumMs) / 1000L
+            SessionState.Running -> max(0L, (now - sessionStartRealtimeMs - sessionPausedAccumMs) / 1000L)
+            SessionState.Paused -> max(0L, (sessionPausedAtMs - sessionStartRealtimeMs - sessionPausedAccumMs) / 1000L)
             else -> 0L
         }
     }
@@ -676,7 +679,7 @@ class MainActivity : Activity() {
         tvDistance = metricTextView("0.00 km")
         tvLap = metricTextView("0")
         tvLapProgress = metricTextView("0.00 / 5.0 km")
-        tvRemain = metricTextView("${targetDistanceKmForCurrentMode()} / 0.0 km")
+        tvRemain = metricTextView("0.0 / ${targetDistanceKmForCurrentMode()} km")
         tvElapsed = metricTextView("00:00:00")
         tvStatus = metricTextView(currentStatusLabel())
         tvBoundary = metricTextView("고주로: 확인 중")
@@ -707,6 +710,7 @@ class MainActivity : Activity() {
             addView(secondaryButton("확인") {
                 selectedTrackOdo = trackOdoInput.text.toString().trim()
                 trackOdoSavedText.text = savedOdoLabel(selectedTrackOdo)
+                updateTrackUi()
                 Toast.makeText(this@MainActivity, "ODO가 저장되었습니다.", Toast.LENGTH_SHORT).show()
             }, LinearLayout.LayoutParams(dp(112), dp(52)))
         }
@@ -833,7 +837,7 @@ class MainActivity : Activity() {
             Toast.makeText(this, "스타트라인을 먼저 설정하세요.", Toast.LENGTH_SHORT).show()
             return
         }
-        if (sessionState == SessionState.Idle || sessionState == SessionState.Finished) {
+        if (sessionState == SessionState.Idle || sessionState == SessionState.Ready || sessionState == SessionState.Finished) {
             stopRedFlashLoop()
             totalDistanceM = 0.0
             lapCount = 0
@@ -972,13 +976,15 @@ class MainActivity : Activity() {
         val totalDistanceKm = totalDistanceM / 1000.0
         val lapDistanceKm = max(0.0, totalDistanceM - lapStartDistanceM) / 1000.0
         val targetKm = targetDistanceKmForCurrentMode()
-        val remainKm = if (targetKm > 0.0) max(0.0, targetKm - totalDistanceKm) else 0.0
+        val odoDistanceKm = odoDistanceKmOrNull()
+        val progressDistanceKm = odoDistanceKm ?: totalDistanceKm
+        val remainKm = if (targetKm > 0.0) max(0.0, targetKm - progressDistanceKm) else 0.0
 
         tvSpeed?.text = String.format(Locale.US, "%.1f km/h", currentSpeedKmh)
         tvDistance?.text = String.format(Locale.US, "%.2f km", totalDistanceKm)
         tvLap?.text = lapCount.toString()
         tvLapProgress?.text = String.format(Locale.US, "%.2f / %.1f km", lapDistanceKm, lapDistanceM / 1000.0)
-        tvRemain?.text = String.format(Locale.US, "%.1f / %.1f km", totalDistanceKm, remainKm)
+        tvRemain?.text = String.format(Locale.US, "%.1f / %.1f km", progressDistanceKm, remainKm)
         tvElapsed?.text = String.format(Locale.US, "%02d:%02d:%02d", elapsedSessionSeconds() / 3600, (elapsedSessionSeconds() % 3600) / 60, elapsedSessionSeconds() % 60)
         tvStatus?.text = currentStatusLabel()
         tvBoundary?.text = trackAreaLabel()
@@ -1005,6 +1011,16 @@ class MainActivity : Activity() {
 
     private fun savedOdoLabel(odo: String): String {
         return if (odo.isBlank()) "저장 ODO: 미입력" else "저장 ODO: $odo km"
+    }
+
+    private fun odoDistanceKmOrNull(): Double? {
+        val currentOdo = selectedTrackOdo.toDoubleOrNull() ?: return null
+        val startOdo = selectedStartOdo.toDoubleOrNull()
+        return if (startOdo != null && currentOdo >= startOdo) {
+            currentOdo - startOdo
+        } else {
+            max(0.0, currentOdo)
+        }
     }
 
     private fun spinnerOf(label: String, vararg items: String, onSelected: ((String) -> Unit)? = null): Spinner {
@@ -1196,6 +1212,14 @@ class MainActivity : Activity() {
 }
 
 private class TrackPreviewView(context: android.content.Context) : View(context) {
+    private data class RouteTransform(
+        val angleRad: Double,
+        val meanX: Float,
+        val meanY: Float,
+        val centerX: Float,
+        val centerY: Float
+    )
+
     private val guideRoadOuterPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
         strokeWidth = dp(28).toFloat()
@@ -1310,22 +1334,23 @@ private class TrackPreviewView(context: android.content.Context) : View(context)
         val right = width.toFloat() - dp(16)
         val top = dp(10).toFloat()
         val bottom = height.toFloat() - dp(20)
+        val guide = stadiumGuideRect(left, right, top, bottom)
 
-        drawStadiumGuide(canvas, left, right, top, bottom)
+        drawStadiumGuide(canvas, guide, right, top)
 
         if (route.size >= 2) {
             routePaint.color = if (inTrack) Color.rgb(30, 64, 175) else Color.rgb(239, 68, 68)
+            val transform = routeTransform()
             val path = Path()
             route.forEachIndexed { index, p ->
-                val m = mapToView(p, left, right, top, bottom)
+                val m = mapToGuide(p, guide, transform)
                 if (index == 0) path.moveTo(m.x, m.y) else path.lineTo(m.x, m.y)
             }
             canvas.drawPath(path, routePaint)
         }
     }
 
-    private fun drawStadiumGuide(canvas: Canvas, left: Float, right: Float, top: Float, bottom: Float) {
-        val guide = stadiumGuideRect(left, right, top, bottom)
+    private fun drawStadiumGuide(canvas: Canvas, guide: RectF, right: Float, top: Float) {
         val radius = min(guide.width(), guide.height()) * 0.5f
         canvas.drawRoundRect(guide, radius, radius, guideRoadOuterPaint)
         canvas.drawRoundRect(guide, radius, radius, guideRoadInnerPaint)
@@ -1337,12 +1362,9 @@ private class TrackPreviewView(context: android.content.Context) : View(context)
     private fun stadiumGuideRect(left: Float, right: Float, top: Float, bottom: Float): RectF {
         val availableWidth = right - left
         val availableHeight = bottom - top
-        val horizontalScale = min(availableWidth / stadiumLongSideM, availableHeight / stadiumShortSideM)
-        val verticalScale = min(availableWidth / stadiumShortSideM, availableHeight / stadiumLongSideM)
-
-        val horizontal = horizontalScale >= verticalScale
-        val guideWidth = if (horizontal) stadiumLongSideM * horizontalScale else stadiumShortSideM * verticalScale
-        val guideHeight = if (horizontal) stadiumShortSideM * horizontalScale else stadiumLongSideM * verticalScale
+        val scale = min(availableWidth / stadiumShortSideM, availableHeight / stadiumLongSideM)
+        val guideWidth = stadiumShortSideM * scale
+        val guideHeight = stadiumLongSideM * scale
         val centerX = (left + right) * 0.5f
         val centerY = (top + bottom) * 0.5f
 
@@ -1354,19 +1376,72 @@ private class TrackPreviewView(context: android.content.Context) : View(context)
         )
     }
 
-    private fun mapToView(point: PointF, left: Float, right: Float, top: Float, bottom: Float): PointF {
-        val spanX = max(1f, maxX - minX)
-        val spanY = max(1f, maxY - minY)
-        val drawableWidth = right - left
-        val drawableHeight = bottom - top
-        val scale = 0.9f * min(drawableWidth / spanX, drawableHeight / spanY)
-        val usedWidth = spanX * scale
-        val usedHeight = spanY * scale
-        val offsetX = left + (drawableWidth - usedWidth) * 0.5f
-        val offsetY = top + (drawableHeight + usedHeight) * 0.5f
-        val x = offsetX + (point.x - minX) * scale
-        val y = offsetY - (point.y - minY) * scale
+    private fun routeTransform(): RouteTransform {
+        if (route.isEmpty()) return RouteTransform(0.0, 0f, 0f, 0f, 0f)
+
+        var meanX = 0.0
+        var meanY = 0.0
+        route.forEach {
+            meanX += it.x
+            meanY += it.y
+        }
+        meanX /= route.size
+        meanY /= route.size
+
+        var covarianceXx = 0.0
+        var covarianceYy = 0.0
+        var covarianceXy = 0.0
+        route.forEach {
+            val dx = it.x - meanX
+            val dy = it.y - meanY
+            covarianceXx += dx * dx
+            covarianceYy += dy * dy
+            covarianceXy += dx * dy
+        }
+        val angleRad = if (route.size >= 4) {
+            0.5 * atan2(2.0 * covarianceXy, covarianceXx - covarianceYy)
+        } else {
+            0.0
+        }
+
+        var minRotatedX = Float.POSITIVE_INFINITY
+        var maxRotatedX = Float.NEGATIVE_INFINITY
+        var minRotatedY = Float.POSITIVE_INFINITY
+        var maxRotatedY = Float.NEGATIVE_INFINITY
+        route.forEach {
+            val rotated = rotateToGuideAxis(it, meanX.toFloat(), meanY.toFloat(), angleRad)
+            minRotatedX = min(minRotatedX, rotated.x)
+            maxRotatedX = max(maxRotatedX, rotated.x)
+            minRotatedY = min(minRotatedY, rotated.y)
+            maxRotatedY = max(maxRotatedY, rotated.y)
+        }
+
+        return RouteTransform(
+            angleRad = angleRad,
+            meanX = meanX.toFloat(),
+            meanY = meanY.toFloat(),
+            centerX = (minRotatedX + maxRotatedX) * 0.5f,
+            centerY = (minRotatedY + maxRotatedY) * 0.5f
+        )
+    }
+
+    private fun mapToGuide(point: PointF, guide: RectF, transform: RouteTransform): PointF {
+        val rotated = rotateToGuideAxis(point, transform.meanX, transform.meanY, transform.angleRad)
+        val scale = min(guide.width() / stadiumShortSideM, guide.height() / stadiumLongSideM)
+        val x = guide.centerX() + (rotated.y - transform.centerY) * scale
+        val y = guide.centerY() - (rotated.x - transform.centerX) * scale
         return PointF(x, y)
+    }
+
+    private fun rotateToGuideAxis(point: PointF, centerX: Float, centerY: Float, angleRad: Double): PointF {
+        val dx = point.x - centerX
+        val dy = point.y - centerY
+        val cosA = cos(angleRad).toFloat()
+        val sinA = sin(angleRad).toFloat()
+        return PointF(
+            dx * cosA + dy * sinA,
+            -dx * sinA + dy * cosA
+        )
     }
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
