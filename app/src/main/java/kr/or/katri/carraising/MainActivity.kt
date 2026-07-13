@@ -10,6 +10,8 @@ import android.graphics.Path
 import android.graphics.PointF
 import android.graphics.RectF
 import android.graphics.Typeface
+import android.media.AudioManager
+import android.media.ToneGenerator
 import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
@@ -109,7 +111,9 @@ class MainActivity : Activity() {
     private var tvStatus: TextView? = null
     private var tvBoundary: TextView? = null
     private var tvStartLine: TextView? = null
+    private var tvBrakePoint: TextView? = null
     private var redFlashOverlay: View? = null
+    private var lapAlarmTone: ToneGenerator? = null
 
     private var btnSetStartLine: Button? = null
     private var btnStartPause: Button? = null
@@ -121,9 +125,7 @@ class MainActivity : Activity() {
     private var selectedTrackOdo = ""
 
     private val targetDistanceKm = 9000.0
-    private val lapDistanceM = 5_000.0
     private val gpsGateMinDistanceM = 4_000.0
-    private val redFlashIntervalM = 5_000.0
     private val startGateRadiusM = 45.0
     private val routePointMinSpacingM = 3.0
     private val stationaryDistanceM = 4.0
@@ -139,7 +141,6 @@ class MainActivity : Activity() {
     private val referenceRouteMinDistanceM = 4_000.0
     private val maxCurrentRoutePoints = 5_000
     private val referenceRoutePrefsKey = "reference_route_points"
-    private var lastRedFlashDistanceBucket = 0
     private var isRedFlashLoopActive = false
 
     private val redFlashLoopRunnable = object : Runnable {
@@ -170,6 +171,13 @@ class MainActivity : Activity() {
         uiHandler.removeCallbacks(uiUpdateRunnable)
         stopRedFlashLoop()
         stopLocationUpdates()
+    }
+
+    override fun onDestroy() {
+        stopRedFlashLoop()
+        lapAlarmTone?.release()
+        lapAlarmTone = null
+        super.onDestroy()
     }
 
     override fun onBackPressed() {
@@ -272,7 +280,6 @@ class MainActivity : Activity() {
 
             if (sessionState == SessionState.Running && acceptedDeltaM > 0.0) {
                 totalDistanceM += acceptedDeltaM
-                triggerRedFlashIfNeeded()
                 appendCurrentRoutePoint(location)
                 evaluateLap(location)
                 updateTrackAreaState(location)
@@ -350,13 +357,6 @@ class MainActivity : Activity() {
         return !location.hasSpeedAccuracy() || location.speedAccuracyMetersPerSecond <= maxSpeedAccuracyMps
     }
 
-    private fun triggerRedFlashIfNeeded() {
-        val bucket = (totalDistanceM / redFlashIntervalM).toInt()
-        if (bucket <= 0 || bucket <= lastRedFlashDistanceBucket) return
-        lastRedFlashDistanceBucket = bucket
-        startRedFlashLoop()
-    }
-
     private fun startRedFlashLoop() {
         if (redFlashOverlay == null) return
         if (isRedFlashLoopActive) return
@@ -407,9 +407,18 @@ class MainActivity : Activity() {
             lastGateDistanceM = totalDistanceM
             wasInStartGate = true
             saveReferenceRouteIfReady()
+            triggerLapAlarm()
         } else if (wasInStartGate && !inGate) {
             wasInStartGate = false
         }
+    }
+
+    private fun triggerLapAlarm() {
+        startRedFlashLoop()
+        if (lapAlarmTone == null) {
+            lapAlarmTone = ToneGenerator(AudioManager.STREAM_ALARM, 100)
+        }
+        lapAlarmTone?.startTone(ToneGenerator.TONE_PROP_BEEP, 700)
     }
 
     private fun isInStartGate(location: Location): Boolean {
@@ -678,7 +687,7 @@ class MainActivity : Activity() {
         tvSpeed = metricTextView("0.0 km/h")
         tvDistance = metricTextView("0.00 km")
         tvLap = metricTextView("0")
-        tvLapProgress = metricTextView("0.00 / 5.0 km")
+        tvLapProgress = metricTextView("0.00 km")
         tvRemain = metricTextView("0.0 / ${targetDistanceKmForCurrentMode()} km")
         tvElapsed = metricTextView("00:00:00")
         tvStatus = metricTextView(currentStatusLabel())
@@ -686,12 +695,14 @@ class MainActivity : Activity() {
         tvStartLine = metricTextView("스타트라인: 미설정")
 
         content.addView(metricRow(metricCard("속도", tvSpeed!!), metricCard("총 주행거리", tvDistance!!)))
-        content.addView(metricRow(metricCard("랩 수", tvLap!!), metricCard("랩 거리", tvLapProgress!!)))
+        content.addView(metricRow(metricCard("랩 수", tvLap!!), metricCard("현재 랩 거리", tvLapProgress!!)))
         content.addView(metricRow(metricCard("경과시간", tvElapsed!!), metricCard("남은 거리", tvRemain!!)))
         content.addView(tvStatus)
         content.addView(space(dp(6)))
         content.addView(tvBoundary)
         content.addView(tvStartLine)
+        tvBrakePoint = metricTextView("브레이크 포인트: 미설정")
+        content.addView(tvBrakePoint)
         content.addView(space(dp(10)))
 
         content.addView(sectionTitle("ODO"))
@@ -843,7 +854,6 @@ class MainActivity : Activity() {
             lapCount = 0
             lapStartDistanceM = 0.0
             lastGateDistanceM = 0.0
-            lastRedFlashDistanceBucket = 0
             currentSpeedKmh = 0.0
             sessionStartRealtimeMs = SystemClock.elapsedRealtime()
             sessionPausedAccumMs = 0L
@@ -903,7 +913,6 @@ class MainActivity : Activity() {
         lapCount = 0
         lapStartDistanceM = 0.0
         lastGateDistanceM = 0.0
-        lastRedFlashDistanceBucket = 0
         wasInStartGate = false
         currentSpeedKmh = 0.0
         stopRedFlashLoop()
@@ -927,7 +936,6 @@ class MainActivity : Activity() {
             lapCount = 0
             lapStartDistanceM = 0.0
             lastGateDistanceM = 0.0
-            lastRedFlashDistanceBucket = 0
             wasInStartGate = true
             currentSpeedKmh = 0.0
             stopRedFlashLoop()
@@ -983,12 +991,13 @@ class MainActivity : Activity() {
         tvSpeed?.text = String.format(Locale.US, "%.1f km/h", currentSpeedKmh)
         tvDistance?.text = String.format(Locale.US, "%.2f km", totalDistanceKm)
         tvLap?.text = lapCount.toString()
-        tvLapProgress?.text = String.format(Locale.US, "%.2f / %.1f km", lapDistanceKm, lapDistanceM / 1000.0)
+        tvLapProgress?.text = String.format(Locale.US, "%.2f km", lapDistanceKm)
         tvRemain?.text = String.format(Locale.US, "%.1f / %.1f km", progressDistanceKm, remainKm)
         tvElapsed?.text = String.format(Locale.US, "%02d:%02d:%02d", elapsedSessionSeconds() / 3600, (elapsedSessionSeconds() % 3600) / 60, elapsedSessionSeconds() % 60)
         tvStatus?.text = currentStatusLabel()
         tvBoundary?.text = trackAreaLabel()
         tvStartLine?.text = if (startLineLocation == null) "스타트라인: 미설정" else "스타트라인: 설정됨"
+        tvBrakePoint?.text = brakePointLabel()
 
         if (location != null) {
             previewView?.setState(
@@ -1011,6 +1020,10 @@ class MainActivity : Activity() {
 
     private fun savedOdoLabel(odo: String): String {
         return if (odo.isBlank()) "저장 ODO: 미입력" else "저장 ODO: $odo km"
+    }
+
+    private fun brakePointLabel(): String {
+        return "브레이크 포인트: 미설정"
     }
 
     private fun odoDistanceKmOrNull(): Double? {
