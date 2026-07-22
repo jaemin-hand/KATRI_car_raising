@@ -8,7 +8,6 @@ import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.PointF
-import android.graphics.RectF
 import android.graphics.Typeface
 import android.media.AudioManager
 import android.media.ToneGenerator
@@ -35,15 +34,15 @@ import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import java.util.Locale
-import kotlin.math.atan2
+import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.max
 import kotlin.math.min
-import kotlin.math.sin
 import kotlin.math.sqrt
 
 private enum class Screen { Home, Preparation, Track }
 private enum class SessionState { Idle, Ready, Running, Paused, Finished }
+private enum class DrivingActionState { CRUISING, WAITING_FOR_BRAKE_LINE, DECELERATING, ACCELERATING }
 
 private data class PrepItem(
     val title: String,
@@ -55,6 +54,11 @@ private data class PrepItem(
 private data class GeoPoint(
     val latitude: Double,
     val longitude: Double
+)
+
+private data class BrakeLineFrame(
+    val tangentEast: Double,
+    val tangentNorth: Double
 )
 
 class MainActivity : Activity() {
@@ -78,10 +82,13 @@ class MainActivity : Activity() {
     private var lapStartDistanceM = 0.0
     private var lapCount = 0
     private var lastGateDistanceM = 0.0
-    private var wasInStartGate = false
+    private var wasInBrakeLineGate = false
     private var currentSpeedKmh = 0.0
     private var insideTrackArea = true
-    private var startLineLocation: Location? = null
+    private var brakeLineLocation: Location? = null
+    private var activeScenarioStepId: String? = null
+    private var drivingActionState = DrivingActionState.CRUISING
+    private var odoConfirmedAtSessionDistanceM = 0.0
 
     private val currentRoutePoints = ArrayList<GeoPoint>()
     private val referenceRoutePoints = ArrayList<GeoPoint>()
@@ -110,12 +117,15 @@ class MainActivity : Activity() {
     private var tvElapsed: TextView? = null
     private var tvStatus: TextView? = null
     private var tvBoundary: TextView? = null
-    private var tvStartLine: TextView? = null
-    private var tvBrakePoint: TextView? = null
+    private var tvBrakeLine: TextView? = null
+    private var tvScenarioSection: TextView? = null
+    private var tvScenarioProgress: TextView? = null
+    private var tvScenarioTarget: TextView? = null
+    private var tvScenarioInstruction: TextView? = null
     private var redFlashOverlay: View? = null
     private var lapAlarmTone: ToneGenerator? = null
 
-    private var btnSetStartLine: Button? = null
+    private var btnSetBrakeLine: Button? = null
     private var btnStartPause: Button? = null
     private var btnStop: Button? = null
 
@@ -126,7 +136,10 @@ class MainActivity : Activity() {
 
     private val targetDistanceKm = 9000.0
     private val gpsGateMinDistanceM = 4_000.0
-    private val startGateRadiusM = 45.0
+    private val brakeLineFallbackRadiusM = 45.0
+    private val brakeLineDetectionHalfWidthM = 25.0
+    private val brakeLineHalfLengthM = 60.0
+    private val speedTargetToleranceKmh = 3.0
     private val routePointMinSpacingM = 3.0
     private val stationaryDistanceM = 4.0
     private val minimumMovingSpeedKmh = 0.8
@@ -141,6 +154,8 @@ class MainActivity : Activity() {
     private val referenceRouteMinDistanceM = 4_000.0
     private val maxCurrentRoutePoints = 5_000
     private val referenceRoutePrefsKey = "reference_route_points"
+    private val brakeLineLatitudePrefsKey = "brake_line_latitude"
+    private val brakeLineLongitudePrefsKey = "brake_line_longitude"
     private var isRedFlashLoopActive = false
 
     private val redFlashLoopRunnable = object : Runnable {
@@ -152,6 +167,7 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         loadReferenceRoute()
+        loadBrakeLine()
         initLocationListener()
         showHome()
     }
@@ -280,11 +296,12 @@ class MainActivity : Activity() {
 
             if (sessionState == SessionState.Running && acceptedDeltaM > 0.0) {
                 totalDistanceM += acceptedDeltaM
+                syncScenarioState()
                 appendCurrentRoutePoint(location)
                 evaluateLap(location)
+                updateDrivingActionState()
                 updateTrackAreaState(location)
                 previewView?.setState(
-                    hasStartLine = startLineLocation != null,
                     isInTrack = insideTrackArea,
                     isRunning = sessionState == SessionState.Running,
                     latitude = location.latitude,
@@ -299,10 +316,10 @@ class MainActivity : Activity() {
 
         previousLocation = prev ?: location
         currentLocation = location
-        if (startLineLocation != null && sessionState != SessionState.Idle) {
+        if (brakeLineLocation != null && sessionState != SessionState.Idle) {
             updateTrackAreaState(location)
         }
-        if (sessionState != SessionState.Running || currentSpeedKmh <= 0.0) {
+        if (sessionState != SessionState.Running) {
             stopRedFlashLoop()
         }
         updateTrackUi()
@@ -399,17 +416,25 @@ class MainActivity : Activity() {
     }
 
     private fun evaluateLap(location: Location) {
-        val inGate = isInStartGate(location)
+        val inGate = isInBrakeLineGate(location)
         val traveledFromLastGate = totalDistanceM - lastGateDistanceM
-        if (!wasInStartGate && inGate && traveledFromLastGate >= gpsGateMinDistanceM) {
+        if (!wasInBrakeLineGate && inGate && traveledFromLastGate >= gpsGateMinDistanceM) {
             lapCount += 1
             lapStartDistanceM = totalDistanceM
             lastGateDistanceM = totalDistanceM
-            wasInStartGate = true
+            wasInBrakeLineGate = true
             saveReferenceRouteIfReady()
-            triggerLapAlarm()
-        } else if (wasInStartGate && !inGate) {
-            wasInStartGate = false
+            startNewLapRoute(location)
+
+            val step = currentScenarioStep()
+            if (step?.driveMode == ScenarioDriveMode.ACCEL_DECEL) {
+                drivingActionState = DrivingActionState.DECELERATING
+                triggerLapAlarm()
+            } else {
+                drivingActionState = DrivingActionState.CRUISING
+            }
+        } else if (wasInBrakeLineGate && !inGate) {
+            wasInBrakeLineGate = false
         }
     }
 
@@ -421,9 +446,54 @@ class MainActivity : Activity() {
         lapAlarmTone?.startTone(ToneGenerator.TONE_PROP_BEEP, 700)
     }
 
-    private fun isInStartGate(location: Location): Boolean {
-        val start = startLineLocation ?: return false
-        return location.distanceTo(start) <= startGateRadiusM
+    private fun isInBrakeLineGate(location: Location): Boolean {
+        val center = brakeLineLocation ?: return false
+        val frame = brakeLineFrame()
+            ?: return location.distanceTo(center) <= brakeLineFallbackRadiusM
+
+        val eastM = longitudeDeltaMeters(location.longitude - center.longitude, center.latitude)
+        val northM = latitudeDeltaMeters(location.latitude - center.latitude)
+        val alongTrackM = eastM * frame.tangentEast + northM * frame.tangentNorth
+        val acrossTrackM = -eastM * frame.tangentNorth + northM * frame.tangentEast
+        return abs(alongTrackM) <= brakeLineDetectionHalfWidthM &&
+            abs(acrossTrackM) <= brakeLineHalfLengthM
+    }
+
+    private fun brakeLineFrame(): BrakeLineFrame? {
+        val center = brakeLineLocation ?: return null
+        val useClosedReference = hasReferenceRoute && referenceRoutePoints.size >= 4
+        val route = if (useClosedReference) referenceRoutePoints else currentRoutePoints
+        if (route.size < 2) return null
+
+        var nearestIndex = 0
+        var nearestDistanceM = Double.POSITIVE_INFINITY
+        route.forEachIndexed { index, point ->
+            val distanceM = distanceMeters(center.latitude, center.longitude, point.latitude, point.longitude)
+            if (distanceM < nearestDistanceM) {
+                nearestDistanceM = distanceM
+                nearestIndex = index
+            }
+        }
+
+        val sampleOffset = min(4, max(1, route.size / 8))
+        val beforeIndex: Int
+        val afterIndex: Int
+        if (useClosedReference) {
+            beforeIndex = (nearestIndex - sampleOffset + route.size) % route.size
+            afterIndex = (nearestIndex + sampleOffset) % route.size
+        } else {
+            beforeIndex = max(0, nearestIndex - sampleOffset)
+            afterIndex = min(route.lastIndex, nearestIndex + sampleOffset)
+        }
+        if (beforeIndex == afterIndex) return null
+
+        val before = route[beforeIndex]
+        val after = route[afterIndex]
+        val eastM = longitudeDeltaMeters(after.longitude - before.longitude, center.latitude)
+        val northM = latitudeDeltaMeters(after.latitude - before.latitude)
+        val lengthM = sqrt(eastM * eastM + northM * northM)
+        if (lengthM < 1.0) return null
+        return BrakeLineFrame(eastM / lengthM, northM / lengthM)
     }
 
     private fun updateTrackAreaState(location: Location) {
@@ -456,10 +526,34 @@ class MainActivity : Activity() {
         if (totalDistanceM < referenceRouteMinDistanceM) return
 
         referenceRoutePoints.clear()
-        referenceRoutePoints.addAll(currentRoutePoints)
+        referenceRoutePoints.addAll(smoothRoute(currentRoutePoints))
         hasReferenceRoute = true
         saveReferenceRoute()
+        previewView?.setReferenceRoute(referenceRoutePoints)
         Toast.makeText(this, "기준 주행 경로가 저장되었습니다.", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun smoothRoute(points: List<GeoPoint>): List<GeoPoint> {
+        if (points.size < 5) return points.toList()
+        val radius = 2
+        return points.indices.map { index ->
+            val from = max(0, index - radius)
+            val to = min(points.lastIndex, index + radius)
+            var latitudeSum = 0.0
+            var longitudeSum = 0.0
+            for (sampleIndex in from..to) {
+                latitudeSum += points[sampleIndex].latitude
+                longitudeSum += points[sampleIndex].longitude
+            }
+            val sampleCount = (to - from + 1).toDouble()
+            GeoPoint(latitudeSum / sampleCount, longitudeSum / sampleCount)
+        }
+    }
+
+    private fun startNewLapRoute(location: Location) {
+        currentRoutePoints.clear()
+        appendCurrentRoutePoint(location, force = true)
+        previewView?.beginLap(location.latitude, location.longitude)
     }
 
     private fun loadReferenceRoute() {
@@ -474,6 +568,24 @@ class MainActivity : Activity() {
             }
         }
         hasReferenceRoute = referenceRoutePoints.size >= referenceRouteMinPoints
+    }
+
+    private fun loadBrakeLine() {
+        val prefs = getPreferences(MODE_PRIVATE)
+        val latitude = prefs.getString(brakeLineLatitudePrefsKey, null)?.toDoubleOrNull() ?: return
+        val longitude = prefs.getString(brakeLineLongitudePrefsKey, null)?.toDoubleOrNull() ?: return
+        brakeLineLocation = Location("saved_brake_line").apply {
+            this.latitude = latitude
+            this.longitude = longitude
+        }
+    }
+
+    private fun saveBrakeLine() {
+        val line = brakeLineLocation ?: return
+        getPreferences(MODE_PRIVATE).edit()
+            .putString(brakeLineLatitudePrefsKey, line.latitude.toString())
+            .putString(brakeLineLongitudePrefsKey, line.longitude.toString())
+            .apply()
     }
 
     private fun saveReferenceRoute() {
@@ -524,6 +636,74 @@ class MainActivity : Activity() {
         val out = FloatArray(1)
         Location.distanceBetween(lat1, lon1, lat2, lon2, out)
         return out[0].toDouble()
+    }
+
+    private fun testProgressDistanceKm(): Double {
+        val gpsDistanceSinceOdoConfirmationKm =
+            max(0.0, totalDistanceM - odoConfirmedAtSessionDistanceM) / 1000.0
+        return confirmedOdoProgressKmOrNull()?.plus(gpsDistanceSinceOdoConfirmationKm)
+            ?: (totalDistanceM / 1000.0)
+    }
+
+    private fun currentScenarioStep(): DrivingScenarioStep? {
+        return KatriDrivingScenario.stepAt(testProgressDistanceKm())
+    }
+
+    private fun syncScenarioState() {
+        val step = currentScenarioStep()
+        if (step?.id == activeScenarioStepId) return
+
+        activeScenarioStepId = step?.id
+        drivingActionState = when (step?.driveMode) {
+            ScenarioDriveMode.ACCEL_DECEL -> DrivingActionState.WAITING_FOR_BRAKE_LINE
+            else -> DrivingActionState.CRUISING
+        }
+        stopRedFlashLoop()
+    }
+
+    private fun updateDrivingActionState() {
+        if (sessionState != SessionState.Running) return
+        val step = currentScenarioStep() ?: return
+        if (step.driveMode != ScenarioDriveMode.ACCEL_DECEL) {
+            drivingActionState = DrivingActionState.CRUISING
+            stopRedFlashLoop()
+            return
+        }
+
+        when (drivingActionState) {
+            DrivingActionState.DECELERATING -> {
+                val target = step.decelTargetKmh ?: return
+                if (currentSpeedKmh <= target + speedTargetToleranceKmh) {
+                    drivingActionState = DrivingActionState.ACCELERATING
+                    stopRedFlashLoop()
+                }
+            }
+            DrivingActionState.ACCELERATING -> {
+                if (currentSpeedKmh >= step.targetSpeedKmh - speedTargetToleranceKmh) {
+                    drivingActionState = DrivingActionState.WAITING_FOR_BRAKE_LINE
+                }
+            }
+            else -> Unit
+        }
+    }
+
+    private fun scenarioInstruction(step: DrivingScenarioStep?): String {
+        if (step == null) return "3000km 이후 차종별 시나리오가 아직 설정되지 않았습니다."
+        if (step.driveMode == ScenarioDriveMode.CONSTANT) {
+            return "${step.targetSpeedKmh}km/h 정속 유지 · 감속 없음"
+        }
+
+        val decelTarget = step.decelTargetKmh ?: 0
+        return when (drivingActionState) {
+            DrivingActionState.WAITING_FOR_BRAKE_LINE ->
+                "브레이크 시작선 통과 시 ${decelTarget}km/h까지 완감속"
+            DrivingActionState.DECELERATING ->
+                "완감속 중 · ${decelTarget}km/h까지 감속"
+            DrivingActionState.ACCELERATING ->
+                "${step.accelerationMethod.label} · ${step.targetSpeedKmh}km/h까지 재가속"
+            DrivingActionState.CRUISING ->
+                "브레이크 시작선 통과 대기"
+        }
     }
 
     private fun targetDistanceKmForCurrentMode(): Double {
@@ -680,8 +860,26 @@ class MainActivity : Activity() {
         }
 
         previewView = TrackPreviewView(this).also { view ->
+            view.setReferenceRoute(referenceRoutePoints)
+            view.setBrakeLine(brakeLineLocation?.latitude, brakeLineLocation?.longitude)
             content.addView(view, fullWidthHeight(dp(230)))
         }
+
+        content.addView(sectionTitle("현재 시나리오"))
+        tvScenarioSection = metricTextView("A-1 · 정속")
+        tvScenarioProgress = summaryText("0.0~100.0km · 전환까지 100.0km")
+        tvScenarioTarget = metricTextView("규정속도 60km/h")
+        tvScenarioInstruction = metricTextView("60km/h 정속 유지 · 감속 없음")
+        content.addView(
+            cardContainer().apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dp(12), dp(10), dp(12), dp(10))
+                addView(tvScenarioSection)
+                addView(tvScenarioProgress)
+                addView(tvScenarioTarget)
+                addView(tvScenarioInstruction)
+            }
+        )
         content.addView(sectionTitle("측정"))
 
         tvSpeed = metricTextView("0.0 km/h")
@@ -692,17 +890,15 @@ class MainActivity : Activity() {
         tvElapsed = metricTextView("00:00:00")
         tvStatus = metricTextView(currentStatusLabel())
         tvBoundary = metricTextView("고주로: 확인 중")
-        tvStartLine = metricTextView("스타트라인: 미설정")
+        tvBrakeLine = metricTextView("브레이크 시작선: 미설정")
 
-        content.addView(metricRow(metricCard("속도", tvSpeed!!), metricCard("총 주행거리", tvDistance!!)))
+        content.addView(metricRow(metricCard("속도", tvSpeed!!), metricCard("시험 누적거리", tvDistance!!)))
         content.addView(metricRow(metricCard("랩 수", tvLap!!), metricCard("현재 랩 거리", tvLapProgress!!)))
         content.addView(metricRow(metricCard("경과시간", tvElapsed!!), metricCard("남은 거리", tvRemain!!)))
         content.addView(tvStatus)
         content.addView(space(dp(6)))
         content.addView(tvBoundary)
-        content.addView(tvStartLine)
-        tvBrakePoint = metricTextView("브레이크 포인트: 미설정")
-        content.addView(tvBrakePoint)
+        content.addView(tvBrakeLine)
         content.addView(space(dp(10)))
 
         content.addView(sectionTitle("ODO"))
@@ -719,7 +915,21 @@ class MainActivity : Activity() {
             gravity = Gravity.CENTER_VERTICAL
             addView(trackOdoInput, LinearLayout.LayoutParams(0, dp(52), 1f).apply { rightMargin = dp(8) })
             addView(secondaryButton("확인") {
-                selectedTrackOdo = trackOdoInput.text.toString().trim()
+                val enteredText = trackOdoInput.text.toString().trim()
+                val enteredOdo = enteredText.toDoubleOrNull()
+                if (enteredOdo == null || enteredOdo < 0.0) {
+                    Toast.makeText(this@MainActivity, "올바른 ODO 값을 입력하세요.", Toast.LENGTH_SHORT).show()
+                    return@secondaryButton
+                }
+                val startOdo = selectedStartOdo.toDoubleOrNull()
+                if (startOdo != null && enteredOdo < startOdo) {
+                    Toast.makeText(this@MainActivity, "현재 ODO는 시작 ODO보다 작을 수 없습니다.", Toast.LENGTH_SHORT).show()
+                    return@secondaryButton
+                }
+                selectedTrackOdo = enteredText
+                odoConfirmedAtSessionDistanceM = totalDistanceM
+                activeScenarioStepId = null
+                syncScenarioState()
                 trackOdoSavedText.text = savedOdoLabel(selectedTrackOdo)
                 updateTrackUi()
                 Toast.makeText(this@MainActivity, "ODO가 저장되었습니다.", Toast.LENGTH_SHORT).show()
@@ -729,8 +939,8 @@ class MainActivity : Activity() {
         content.addView(trackOdoSavedText)
         content.addView(space(dp(10)))
 
-        btnSetStartLine = secondaryButton("현재 위치를 스타트라인으로 설정") {
-            requestLocationPermission { setStartLine() }
+        btnSetBrakeLine = secondaryButton("현재 위치를 브레이크 시작선으로 설정") {
+            requestLocationPermission { setBrakeLine() }
         }
         btnStartPause = primaryButton("주행 시작") {
             when (sessionState) {
@@ -747,7 +957,7 @@ class MainActivity : Activity() {
             }
         }
 
-        content.addView(btnSetStartLine, compactFullWidth())
+        content.addView(btnSetBrakeLine, compactFullWidth())
         content.addView(
             LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
@@ -844,8 +1054,8 @@ class MainActivity : Activity() {
     }
 
     private fun startSession() {
-        if (startLineLocation == null) {
-            Toast.makeText(this, "스타트라인을 먼저 설정하세요.", Toast.LENGTH_SHORT).show()
+        if (brakeLineLocation == null) {
+            Toast.makeText(this, "브레이크 시작선을 먼저 설정하세요.", Toast.LENGTH_SHORT).show()
             return
         }
         if (sessionState == SessionState.Idle || sessionState == SessionState.Ready || sessionState == SessionState.Finished) {
@@ -855,13 +1065,16 @@ class MainActivity : Activity() {
             lapStartDistanceM = 0.0
             lastGateDistanceM = 0.0
             currentSpeedKmh = 0.0
+            odoConfirmedAtSessionDistanceM = 0.0
+            activeScenarioStepId = null
+            drivingActionState = DrivingActionState.CRUISING
             sessionStartRealtimeMs = SystemClock.elapsedRealtime()
             sessionPausedAccumMs = 0L
             sessionPausedAtMs = 0L
             previewView?.clearPath()
             currentRoutePoints.clear()
             currentLocation?.let { appendCurrentRoutePoint(it, force = true) }
-            wasInStartGate = true
+            wasInBrakeLineGate = true
             previousLocation = currentLocation
             previousLocationUpdateMs = SystemClock.elapsedRealtime()
         } else if (sessionState == SessionState.Paused) {
@@ -869,8 +1082,9 @@ class MainActivity : Activity() {
             sessionPausedAtMs = 0L
         }
 
-        wasInStartGate = isInStartGate(currentLocation ?: startLineLocation!!)
+        wasInBrakeLineGate = isInBrakeLineGate(currentLocation ?: brakeLineLocation!!)
         sessionState = SessionState.Running
+        syncScenarioState()
         updateControlButtons()
         updateTrackUi()
     }
@@ -898,7 +1112,6 @@ class MainActivity : Activity() {
 
     private fun stopSession() {
         if (sessionState == SessionState.Idle || sessionState == SessionState.Ready) return
-        saveReferenceRouteIfReady()
         sessionState = SessionState.Finished
         currentSpeedKmh = 0.0
         stopRedFlashLoop()
@@ -913,8 +1126,11 @@ class MainActivity : Activity() {
         lapCount = 0
         lapStartDistanceM = 0.0
         lastGateDistanceM = 0.0
-        wasInStartGate = false
+        wasInBrakeLineGate = false
         currentSpeedKmh = 0.0
+        odoConfirmedAtSessionDistanceM = 0.0
+        activeScenarioStepId = null
+        drivingActionState = DrivingActionState.CRUISING
         stopRedFlashLoop()
         currentRoutePoints.clear()
         sessionState = SessionState.Ready
@@ -923,36 +1139,37 @@ class MainActivity : Activity() {
         previewView?.clearPath()
     }
 
-    private fun setStartLine() {
+    private fun setBrakeLine() {
         requestLocationPermission {
             val now = currentLocation
             if (now == null) {
                 Toast.makeText(this, "현재 위치를 사용할 수 없습니다.", Toast.LENGTH_SHORT).show()
                 return@requestLocationPermission
             }
-            startLineLocation = Location(now)
+            brakeLineLocation = Location(now)
+            saveBrakeLine()
             sessionState = SessionState.Ready
             totalDistanceM = 0.0
             lapCount = 0
             lapStartDistanceM = 0.0
             lastGateDistanceM = 0.0
-            wasInStartGate = true
+            wasInBrakeLineGate = true
             currentSpeedKmh = 0.0
+            odoConfirmedAtSessionDistanceM = 0.0
+            activeScenarioStepId = null
+            drivingActionState = DrivingActionState.CRUISING
             stopRedFlashLoop()
             sessionStartRealtimeMs = 0L
             sessionPausedAccumMs = 0L
             sessionPausedAtMs = 0L
             currentRoutePoints.clear()
             previewView?.clearPath()
-            previewView?.setState(
-                hasStartLine = true,
-                isInTrack = true,
-                isRunning = false
-            )
-            tvStartLine?.text = "스타트라인: 설정됨"
+            previewView?.setBrakeLine(now.latitude, now.longitude)
+            previewView?.setState(isInTrack = true, isRunning = false)
+            tvBrakeLine?.text = "브레이크 시작선: 설정됨"
             updateControlButtons()
             updateTrackUi()
-            Toast.makeText(this, "스타트라인이 설정되었습니다.", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "브레이크 시작선이 설정되었습니다.", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -964,8 +1181,12 @@ class MainActivity : Activity() {
         }
         btnStartPause?.text = startLabel
         btnStop?.text = if (sessionState == SessionState.Finished) "초기화" else "정지"
-        btnSetStartLine?.isEnabled = sessionState != SessionState.Running
-        btnSetStartLine?.text = if (startLineLocation == null) "현재 위치를 스타트라인으로 설정" else "스타트라인 재설정"
+        btnSetBrakeLine?.isEnabled = sessionState != SessionState.Running
+        btnSetBrakeLine?.text = if (brakeLineLocation == null) {
+            "현재 위치를 브레이크 시작선으로 설정"
+        } else {
+            "브레이크 시작선 재설정"
+        }
     }
 
     private fun updateTrackUi() {
@@ -976,32 +1197,55 @@ class MainActivity : Activity() {
         ) {
             currentSpeedKmh = 0.0
         }
-        if (sessionState != SessionState.Running || currentSpeedKmh <= 0.0) {
+        if (sessionState != SessionState.Running) {
             stopRedFlashLoop()
         }
 
         val location = currentLocation
-        val totalDistanceKm = totalDistanceM / 1000.0
         val lapDistanceKm = max(0.0, totalDistanceM - lapStartDistanceM) / 1000.0
         val targetKm = targetDistanceKmForCurrentMode()
-        val odoDistanceKm = odoDistanceKmOrNull()
-        val progressDistanceKm = odoDistanceKm ?: totalDistanceKm
+        val progressDistanceKm = testProgressDistanceKm()
         val remainKm = if (targetKm > 0.0) max(0.0, targetKm - progressDistanceKm) else 0.0
+        syncScenarioState()
+        updateDrivingActionState()
+        val scenarioStep = currentScenarioStep()
 
         tvSpeed?.text = String.format(Locale.US, "%.1f km/h", currentSpeedKmh)
-        tvDistance?.text = String.format(Locale.US, "%.2f km", totalDistanceKm)
+        tvDistance?.text = String.format(Locale.US, "%.2f km", progressDistanceKm)
         tvLap?.text = lapCount.toString()
         tvLapProgress?.text = String.format(Locale.US, "%.2f km", lapDistanceKm)
         tvRemain?.text = String.format(Locale.US, "%.1f / %.1f km", progressDistanceKm, remainKm)
         tvElapsed?.text = String.format(Locale.US, "%02d:%02d:%02d", elapsedSessionSeconds() / 3600, (elapsedSessionSeconds() % 3600) / 60, elapsedSessionSeconds() % 60)
         tvStatus?.text = currentStatusLabel()
         tvBoundary?.text = trackAreaLabel()
-        tvStartLine?.text = if (startLineLocation == null) "스타트라인: 미설정" else "스타트라인: 설정됨"
-        tvBrakePoint?.text = brakePointLabel()
+        tvBrakeLine?.text = brakeLineStatusLabel(scenarioStep)
+        if (scenarioStep == null) {
+            tvScenarioSection?.text = "시나리오 미설정"
+            tvScenarioProgress?.text = String.format(Locale.US, "현재 %.1fkm · 설정 범위 0~3000km", progressDistanceKm)
+            tvScenarioTarget?.text = "규정속도 -"
+        } else {
+            val nextTransitionKm = max(0.0, scenarioStep.endKm - progressDistanceKm)
+            tvScenarioSection?.text = "${scenarioStep.id} · ${scenarioStep.driveMode.label}"
+            tvScenarioProgress?.text = String.format(
+                Locale.US,
+                "%.0f~%.0fkm · 전환까지 %.1fkm",
+                scenarioStep.startKm,
+                scenarioStep.endKm,
+                nextTransitionKm
+            )
+            tvScenarioTarget?.text = "규정속도 ${scenarioStep.targetSpeedKmh}km/h"
+        }
+        tvScenarioInstruction?.text = scenarioInstruction(scenarioStep)
+        tvScenarioInstruction?.setTextColor(
+            when (drivingActionState) {
+                DrivingActionState.DECELERATING -> Color.rgb(185, 28, 28)
+                DrivingActionState.ACCELERATING -> ScreenColors.Primary
+                else -> ScreenColors.Text
+            }
+        )
 
         if (location != null) {
             previewView?.setState(
-                hasStartLine = startLineLocation != null,
                 isInTrack = insideTrackArea,
                 isRunning = sessionState == SessionState.Running,
                 latitude = location.latitude,
@@ -1022,18 +1266,24 @@ class MainActivity : Activity() {
         return if (odo.isBlank()) "저장 ODO: 미입력" else "저장 ODO: $odo km"
     }
 
-    private fun brakePointLabel(): String {
-        return "브레이크 포인트: 미설정"
+    private fun brakeLineStatusLabel(step: DrivingScenarioStep?): String {
+        if (brakeLineLocation == null) return "브레이크 시작선: 미설정"
+        if (step?.driveMode != ScenarioDriveMode.ACCEL_DECEL) {
+            return "브레이크 시작선: 설정됨 · 현재 구간 감속 경보 없음"
+        }
+        return when (drivingActionState) {
+            DrivingActionState.WAITING_FOR_BRAKE_LINE -> "브레이크 시작선: 통과 대기"
+            DrivingActionState.DECELERATING -> "브레이크 시작선: 통과 · 완감속 중"
+            DrivingActionState.ACCELERATING -> "브레이크 시작선: 통과 · 재가속 중"
+            DrivingActionState.CRUISING -> "브레이크 시작선: 설정됨"
+        }
     }
 
-    private fun odoDistanceKmOrNull(): Double? {
+    private fun confirmedOdoProgressKmOrNull(): Double? {
         val currentOdo = selectedTrackOdo.toDoubleOrNull() ?: return null
         val startOdo = selectedStartOdo.toDoubleOrNull()
-        return if (startOdo != null && currentOdo >= startOdo) {
-            currentOdo - startOdo
-        } else {
-            max(0.0, currentOdo)
-        }
+        if (startOdo != null && currentOdo < startOdo) return null
+        return if (startOdo != null) currentOdo - startOdo else max(0.0, currentOdo)
     }
 
     private fun spinnerOf(label: String, vararg items: String, onSelected: ((String) -> Unit)? = null): Spinner {
@@ -1225,236 +1475,282 @@ class MainActivity : Activity() {
 }
 
 private class TrackPreviewView(context: android.content.Context) : View(context) {
-    private data class RouteTransform(
-        val angleRad: Double,
-        val meanX: Float,
-        val meanY: Float,
-        val centerX: Float,
-        val centerY: Float
+    private data class Projection(val originLatitude: Double, val originLongitude: Double)
+
+    private data class ViewTransform(
+        val centerMetersX: Float,
+        val centerMetersY: Float,
+        val centerViewX: Float,
+        val centerViewY: Float,
+        val scale: Float
     )
 
-    private val guideRoadOuterPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+    private val referencePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
-        strokeWidth = dp(28).toFloat()
+        strokeWidth = dp(7).toFloat()
         strokeCap = Paint.Cap.ROUND
         strokeJoin = Paint.Join.ROUND
-        color = Color.rgb(203, 213, 225)
-    }
-    private val guideRoadInnerPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.STROKE
-        strokeWidth = dp(18).toFloat()
-        strokeCap = Paint.Cap.ROUND
-        strokeJoin = Paint.Join.ROUND
-        color = Color.rgb(248, 250, 252)
-    }
-    private val guideLabelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.FILL
-        textAlign = Paint.Align.CENTER
-        textSize = dp(11).toFloat()
-        typeface = Typeface.DEFAULT_BOLD
-        color = Color.rgb(71, 85, 105)
+        color = Color.rgb(148, 163, 184)
     }
     private val routePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
         strokeWidth = dp(3).toFloat()
         strokeCap = Paint.Cap.ROUND
         strokeJoin = Paint.Join.ROUND
-        color = Color.rgb(30, 64, 175)
+        color = ScreenColors.Primary
     }
-    private val route = ArrayList<PointF>()
-    private val maxRouteSize = 600
-    private val stadiumLongSideM = 2_000f
-    private val stadiumShortSideM = 725f
+    private val brakeLineOutlinePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = dp(7).toFloat()
+        strokeCap = Paint.Cap.ROUND
+        color = Color.WHITE
+    }
+    private val brakeLinePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = dp(4).toFloat()
+        strokeCap = Paint.Cap.ROUND
+        color = Color.rgb(220, 38, 38)
+    }
+    private val currentLocationOutlinePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+        color = Color.WHITE
+    }
+    private val currentLocationPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+        color = Color.rgb(22, 163, 74)
+    }
+    private val labelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+        textSize = dp(11).toFloat()
+        typeface = Typeface.DEFAULT_BOLD
+        color = ScreenColors.MutedText
+    }
+    private val brakeLabelPaint = Paint(labelPaint).apply {
+        textAlign = Paint.Align.CENTER
+        color = Color.rgb(185, 28, 28)
+    }
+
+    private val currentRoute = ArrayList<GeoPoint>()
+    private val referenceRoute = ArrayList<GeoPoint>()
+    private val maxRouteSize = 1_200
+    private val minimumPointSpacingM = 0.8
+    private val brakeLineHalfLengthM = 60f
+    private var brakeLine: GeoPoint? = null
     private var inTrack = true
     private var running = false
-    private var hasStartLine = false
-
-    private var originLat = 0.0
-    private var originLon = 0.0
-    private var hasOrigin = false
-    private var minX = 0f
-    private var maxX = 0f
-    private var minY = 0f
-    private var maxY = 0f
 
     fun setState(
-        hasStartLine: Boolean,
         isInTrack: Boolean,
         isRunning: Boolean,
         latitude: Double? = null,
         longitude: Double? = null
     ) {
-        this.hasStartLine = hasStartLine
-        this.inTrack = isInTrack
-        this.running = isRunning
+        inTrack = isInTrack
+        running = isRunning
         if (isRunning && latitude != null && longitude != null) {
-            addRoutePoint(latitude, longitude)
+            addRoutePoint(GeoPoint(latitude, longitude))
         }
+        invalidate()
+    }
+
+    fun setReferenceRoute(points: List<GeoPoint>) {
+        referenceRoute.clear()
+        referenceRoute.addAll(points)
+        invalidate()
+    }
+
+    fun setBrakeLine(latitude: Double?, longitude: Double?) {
+        brakeLine = if (latitude != null && longitude != null) GeoPoint(latitude, longitude) else null
+        invalidate()
+    }
+
+    fun beginLap(latitude: Double, longitude: Double) {
+        currentRoute.clear()
+        addRoutePoint(GeoPoint(latitude, longitude))
         invalidate()
     }
 
     fun clearPath() {
-        route.clear()
-        hasOrigin = false
+        currentRoute.clear()
         invalidate()
     }
 
-    private fun addRoutePoint(latitude: Double, longitude: Double) {
-        val point = if (!hasOrigin) {
-            originLat = latitude
-            originLon = longitude
-            hasOrigin = true
-            minX = 0f; maxX = 0f; minY = 0f; maxY = 0f
-            PointF(0f, 0f)
-        } else {
-            val cosLat = cos(Math.toRadians(originLat)).toFloat()
-            PointF(
-                ((longitude - originLon) * 111_320.0 * cosLat).toFloat(),
-                ((latitude - originLat) * 110_540.0).toFloat()
-            )
-        }
-
-        if (route.isNotEmpty()) {
-            val last = route[route.size - 1]
-            val dx = last.x - point.x
-            val dy = last.y - point.y
-            if (sqrt(dx * dx + dy * dy) < 0.8f) return
-        }
-
-        route.add(point)
-        minX = if (route.size == 1) point.x else min(minX, point.x)
-        maxX = if (route.size == 1) point.x else max(maxX, point.x)
-        minY = if (route.size == 1) point.y else min(minY, point.y)
-        maxY = if (route.size == 1) point.y else max(maxY, point.y)
-        if (route.size > maxRouteSize) route.removeAt(0)
-        if (route.isNotEmpty()) {
-            minX = Float.POSITIVE_INFINITY
-            maxX = Float.NEGATIVE_INFINITY
-            minY = Float.POSITIVE_INFINITY
-            maxY = Float.NEGATIVE_INFINITY
-            route.forEach {
-                minX = min(minX, it.x); maxX = max(maxX, it.x)
-                minY = min(minY, it.y); maxY = max(maxY, it.y)
-            }
-        }
+    private fun addRoutePoint(point: GeoPoint) {
+        val last = currentRoute.lastOrNull()
+        if (last != null && distanceMeters(last, point) < minimumPointSpacingM) return
+        currentRoute.add(point)
+        if (currentRoute.size > maxRouteSize) currentRoute.removeAt(0)
     }
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
         if (width <= 0 || height <= 0) return
 
-        val left = dp(16).toFloat()
-        val right = width.toFloat() - dp(16)
-        val top = dp(10).toFloat()
-        val bottom = height.toFloat() - dp(20)
-        val guide = stadiumGuideRect(left, right, top, bottom)
-
-        drawStadiumGuide(canvas, guide, right, top)
-
-        if (route.size >= 2) {
-            routePaint.color = if (inTrack) Color.rgb(30, 64, 175) else Color.rgb(239, 68, 68)
-            val transform = routeTransform()
-            val path = Path()
-            route.forEachIndexed { index, p ->
-                val m = mapToGuide(p, guide, transform)
-                if (index == 0) path.moveTo(m.x, m.y) else path.lineTo(m.x, m.y)
+        val baseRoute = if (referenceRoute.isNotEmpty()) referenceRoute else currentRoute
+        if (baseRoute.isEmpty()) {
+            if (brakeLine != null) {
+                val centerY = height * 0.5f
+                val startX = width * 0.25f
+                val endX = width * 0.75f
+                canvas.drawLine(startX, centerY, endX, centerY, brakeLineOutlinePaint)
+                canvas.drawLine(startX, centerY, endX, centerY, brakeLinePaint)
+                canvas.drawText("브레이크 시작선", width * 0.5f, centerY - dp(8), brakeLabelPaint)
             }
-            canvas.drawPath(path, routePaint)
+            canvas.drawText("첫 랩 GPS 경로 수집 대기", dp(16).toFloat(), dp(20).toFloat(), labelPaint)
+            return
         }
-    }
 
-    private fun drawStadiumGuide(canvas: Canvas, guide: RectF, right: Float, top: Float) {
-        val radius = min(guide.width(), guide.height()) * 0.5f
-        canvas.drawRoundRect(guide, radius, radius, guideRoadOuterPaint)
-        canvas.drawRoundRect(guide, radius, radius, guideRoadInnerPaint)
-
-        canvas.drawText("2000m", guide.centerX(), max(top + dp(12), guide.top - dp(8)), guideLabelPaint)
-        canvas.drawText("725m", min(right - dp(22), guide.right + dp(18)), guide.centerY() + dp(4), guideLabelPaint)
-    }
-
-    private fun stadiumGuideRect(left: Float, right: Float, top: Float, bottom: Float): RectF {
-        val availableWidth = right - left
-        val availableHeight = bottom - top
-        val scale = min(availableWidth / stadiumShortSideM, availableHeight / stadiumLongSideM)
-        val guideWidth = stadiumShortSideM * scale
-        val guideHeight = stadiumLongSideM * scale
-        val centerX = (left + right) * 0.5f
-        val centerY = (top + bottom) * 0.5f
-
-        return RectF(
-            centerX - guideWidth * 0.5f,
-            centerY - guideHeight * 0.5f,
-            centerX + guideWidth * 0.5f,
-            centerY + guideHeight * 0.5f
-        )
-    }
-
-    private fun routeTransform(): RouteTransform {
-        if (route.isEmpty()) return RouteTransform(0.0, 0f, 0f, 0f, 0f)
-
-        var meanX = 0.0
-        var meanY = 0.0
-        route.forEach {
-            meanX += it.x
-            meanY += it.y
-        }
-        meanX /= route.size
-        meanY /= route.size
-
-        var covarianceXx = 0.0
-        var covarianceYy = 0.0
-        var covarianceXy = 0.0
-        route.forEach {
-            val dx = it.x - meanX
-            val dy = it.y - meanY
-            covarianceXx += dx * dx
-            covarianceYy += dy * dy
-            covarianceXy += dx * dy
-        }
-        val angleRad = if (route.size >= 4) {
-            0.5 * atan2(2.0 * covarianceXy, covarianceXx - covarianceYy)
+        val projection = Projection(baseRoute.first().latitude, baseRoute.first().longitude)
+        val projectedReference = referenceRoute.map { project(it, projection) }
+        val projectedCurrent = currentRoute.map { project(it, projection) }
+        val projectedBrakeLine = brakeLine?.let { project(it, projection) }
+        val boundsPoints = if (projectedReference.isNotEmpty()) {
+            projectedReference + listOfNotNull(projectedBrakeLine)
         } else {
-            0.0
+            projectedCurrent + listOfNotNull(projectedBrakeLine)
+        }
+        val transform = viewTransform(boundsPoints)
+
+        if (projectedReference.size >= 2) {
+            drawRoute(canvas, projectedReference, transform, referencePaint, closePath = true)
+            canvas.drawText("첫 랩 기준 경로", dp(12).toFloat(), dp(18).toFloat(), labelPaint)
+        } else {
+            canvas.drawText("첫 랩 기준 경로 수집 중", dp(12).toFloat(), dp(18).toFloat(), labelPaint)
         }
 
-        var minRotatedX = Float.POSITIVE_INFINITY
-        var maxRotatedX = Float.NEGATIVE_INFINITY
-        var minRotatedY = Float.POSITIVE_INFINITY
-        var maxRotatedY = Float.NEGATIVE_INFINITY
-        route.forEach {
-            val rotated = rotateToGuideAxis(it, meanX.toFloat(), meanY.toFloat(), angleRad)
-            minRotatedX = min(minRotatedX, rotated.x)
-            maxRotatedX = max(maxRotatedX, rotated.x)
-            minRotatedY = min(minRotatedY, rotated.y)
-            maxRotatedY = max(maxRotatedY, rotated.y)
+        if (projectedCurrent.size >= 2) {
+            routePaint.color = if (inTrack) ScreenColors.Primary else Color.rgb(239, 68, 68)
+            drawRoute(canvas, projectedCurrent, transform, routePaint, closePath = false)
         }
 
-        return RouteTransform(
-            angleRad = angleRad,
-            meanX = meanX.toFloat(),
-            meanY = meanY.toFloat(),
-            centerX = (minRotatedX + maxRotatedX) * 0.5f,
-            centerY = (minRotatedY + maxRotatedY) * 0.5f
+        if (projectedBrakeLine != null) {
+            drawBrakeLine(canvas, projectedBrakeLine, projectedReference, projectedCurrent, transform)
+        }
+
+        projectedCurrent.lastOrNull()?.let { current ->
+            val mapped = mapToView(current, transform)
+            canvas.drawCircle(mapped.x, mapped.y, dp(7).toFloat(), currentLocationOutlinePaint)
+            canvas.drawCircle(mapped.x, mapped.y, dp(4).toFloat(), currentLocationPaint)
+        }
+    }
+
+    private fun drawRoute(
+        canvas: Canvas,
+        points: List<PointF>,
+        transform: ViewTransform,
+        paint: Paint,
+        closePath: Boolean
+    ) {
+        val path = Path()
+        points.forEachIndexed { index, point ->
+            val mapped = mapToView(point, transform)
+            if (index == 0) path.moveTo(mapped.x, mapped.y) else path.lineTo(mapped.x, mapped.y)
+        }
+        if (closePath) path.close()
+        canvas.drawPath(path, paint)
+    }
+
+    private fun drawBrakeLine(
+        canvas: Canvas,
+        center: PointF,
+        projectedReference: List<PointF>,
+        projectedCurrent: List<PointF>,
+        transform: ViewTransform
+    ) {
+        val route = if (projectedReference.size >= 2) projectedReference else projectedCurrent
+        var tangentX = 0f
+        var tangentY = 1f
+        if (route.size >= 2) {
+            val nearestIndex = route.indices.minByOrNull { index ->
+                val dx = route[index].x - center.x
+                val dy = route[index].y - center.y
+                dx * dx + dy * dy
+            } ?: 0
+            val sampleOffset = min(4, max(1, route.size / 8))
+            val closed = projectedReference.size >= 4
+            val beforeIndex = if (closed) {
+                (nearestIndex - sampleOffset + route.size) % route.size
+            } else {
+                max(0, nearestIndex - sampleOffset)
+            }
+            val afterIndex = if (closed) {
+                (nearestIndex + sampleOffset) % route.size
+            } else {
+                min(route.lastIndex, nearestIndex + sampleOffset)
+            }
+            val dx = route[afterIndex].x - route[beforeIndex].x
+            val dy = route[afterIndex].y - route[beforeIndex].y
+            val length = sqrt(dx * dx + dy * dy)
+            if (length >= 1f) {
+                tangentX = dx / length
+                tangentY = dy / length
+            }
+        }
+
+        val normalX = -tangentY
+        val normalY = tangentX
+        val start = PointF(center.x - normalX * brakeLineHalfLengthM, center.y - normalY * brakeLineHalfLengthM)
+        val end = PointF(center.x + normalX * brakeLineHalfLengthM, center.y + normalY * brakeLineHalfLengthM)
+        val mappedStart = mapToView(start, transform)
+        val mappedEnd = mapToView(end, transform)
+        canvas.drawLine(mappedStart.x, mappedStart.y, mappedEnd.x, mappedEnd.y, brakeLineOutlinePaint)
+        canvas.drawLine(mappedStart.x, mappedStart.y, mappedEnd.x, mappedEnd.y, brakeLinePaint)
+
+        val mappedCenter = mapToView(center, transform)
+        canvas.drawText("브레이크 시작선", mappedCenter.x, mappedCenter.y - dp(8), brakeLabelPaint)
+    }
+
+    private fun viewTransform(points: List<PointF>): ViewTransform {
+        var minX = points.minOf { it.x }
+        var maxX = points.maxOf { it.x }
+        var minY = points.minOf { it.y }
+        var maxY = points.maxOf { it.y }
+        val minimumSpanM = 100f
+        if (maxX - minX < minimumSpanM) {
+            val center = (minX + maxX) * 0.5f
+            minX = center - minimumSpanM * 0.5f
+            maxX = center + minimumSpanM * 0.5f
+        }
+        if (maxY - minY < minimumSpanM) {
+            val center = (minY + maxY) * 0.5f
+            minY = center - minimumSpanM * 0.5f
+            maxY = center + minimumSpanM * 0.5f
+        }
+
+        val horizontalPadding = dp(22).toFloat()
+        val topPadding = dp(30).toFloat()
+        val bottomPadding = dp(18).toFloat()
+        val availableWidth = max(1f, width - horizontalPadding * 2f)
+        val availableHeight = max(1f, height - topPadding - bottomPadding)
+        val scale = min(availableWidth / (maxX - minX), availableHeight / (maxY - minY))
+        return ViewTransform(
+            centerMetersX = (minX + maxX) * 0.5f,
+            centerMetersY = (minY + maxY) * 0.5f,
+            centerViewX = width * 0.5f,
+            centerViewY = topPadding + availableHeight * 0.5f,
+            scale = scale
         )
     }
 
-    private fun mapToGuide(point: PointF, guide: RectF, transform: RouteTransform): PointF {
-        val rotated = rotateToGuideAxis(point, transform.meanX, transform.meanY, transform.angleRad)
-        val scale = min(guide.width() / stadiumShortSideM, guide.height() / stadiumLongSideM)
-        val x = guide.centerX() + (rotated.y - transform.centerY) * scale
-        val y = guide.centerY() - (rotated.x - transform.centerX) * scale
-        return PointF(x, y)
-    }
-
-    private fun rotateToGuideAxis(point: PointF, centerX: Float, centerY: Float, angleRad: Double): PointF {
-        val dx = point.x - centerX
-        val dy = point.y - centerY
-        val cosA = cos(angleRad).toFloat()
-        val sinA = sin(angleRad).toFloat()
+    private fun mapToView(point: PointF, transform: ViewTransform): PointF {
         return PointF(
-            dx * cosA + dy * sinA,
-            -dx * sinA + dy * cosA
+            transform.centerViewX + (point.x - transform.centerMetersX) * transform.scale,
+            transform.centerViewY - (point.y - transform.centerMetersY) * transform.scale
         )
+    }
+
+    private fun project(point: GeoPoint, projection: Projection): PointF {
+        val eastM = (point.longitude - projection.originLongitude) *
+            111_320.0 * cos(Math.toRadians(projection.originLatitude))
+        val northM = (point.latitude - projection.originLatitude) * 110_540.0
+        return PointF(eastM.toFloat(), northM.toFloat())
+    }
+
+    private fun distanceMeters(first: GeoPoint, second: GeoPoint): Double {
+        val baseLatitude = (first.latitude + second.latitude) * 0.5
+        val eastM = (second.longitude - first.longitude) * 111_320.0 * cos(Math.toRadians(baseLatitude))
+        val northM = (second.latitude - first.latitude) * 110_540.0
+        return sqrt(eastM * eastM + northM * northM)
     }
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()

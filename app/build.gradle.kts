@@ -22,6 +22,10 @@ extensions.configure<BaseAppModuleExtension>("android") {
     }
 }
 
+dependencies {
+    add("testImplementation", "junit:junit:4.13.2")
+}
+
 tasks.withType<KotlinCompile>().configureEach {
     kotlinOptions {
         jvmTarget = "17"
