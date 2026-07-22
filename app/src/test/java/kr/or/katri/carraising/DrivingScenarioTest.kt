@@ -38,18 +38,18 @@ class DrivingScenarioTest {
         )
 
         expected.forEach { (distanceKm, stepId) ->
-            assertEquals(stepId, KatriDrivingScenario.stepAt(distanceKm)?.id)
+            assertEquals(stepId, KatriDrivingScenario.commonStepAt(distanceKm)?.id)
         }
     }
 
     @Test
     fun configuredValuesMatchTheProvidedScenario() {
-        val stopStep = KatriDrivingScenario.stepAt(150.0)!!
+        val stopStep = KatriDrivingScenario.commonStepAt(150.0)!!
         assertEquals(60, stopStep.targetSpeedKmh)
         assertEquals(0, stopStep.decelTargetKmh)
         assertEquals(AccelerationMethod.SMOOTH, stopStep.accelerationMethod)
 
-        val wotStep = KatriDrivingScenario.stepAt(2_150.0)!!
+        val wotStep = KatriDrivingScenario.commonStepAt(2_150.0)!!
         assertEquals(145, wotStep.targetSpeedKmh)
         assertEquals(110, wotStep.decelTargetKmh)
         assertEquals(AccelerationMethod.WOT, wotStep.accelerationMethod)
@@ -57,19 +57,45 @@ class DrivingScenarioTest {
 
     @Test
     fun distanceOutsideConfiguredRangeHasNoStep() {
-        assertNull(KatriDrivingScenario.stepAt(-0.1))
-        assertNull(KatriDrivingScenario.stepAt(3_000.0))
-        assertNull(KatriDrivingScenario.stepAt(Double.NaN))
+        assertNull(KatriDrivingScenario.commonStepAt(-0.1))
+        assertNull(KatriDrivingScenario.commonStepAt(3_000.0))
+        assertNull(KatriDrivingScenario.commonStepAt(Double.NaN))
+        assertNull(KatriDrivingScenario.stepAt(9_000.0, PowertrainType.COMBUSTION))
+        assertNull(KatriDrivingScenario.stepAt(9_000.0, PowertrainType.HYBRID))
     }
 
     @Test
     fun configuredStepsAreContinuousWithoutGaps() {
-        val steps = KatriDrivingScenario.steps
+        val steps = KatriDrivingScenario.commonSteps
         assertEquals(0.0, steps.first().startKm, 0.0)
-        assertEquals(KatriDrivingScenario.configuredEndKm, steps.last().endKm, 0.0)
+        assertEquals(KatriDrivingScenario.commonConfiguredEndKm, steps.last().endKm, 0.0)
         steps.zipWithNext().forEach { (current, next) ->
             assertEquals(current.endKm, next.startKm, 0.0)
             assertTrue(current.endKm > current.startKm)
         }
+    }
+
+    @Test
+    fun combustionRepeatsHPatternAfterThreeThousandKm() {
+        val constant = KatriDrivingScenario.stepAt(3_000.0, PowertrainType.COMBUSTION)!!
+        assertEquals(145, constant.targetSpeedKmh)
+        assertEquals(ScenarioDriveMode.CONSTANT, constant.driveMode)
+
+        val accelDecel = KatriDrivingScenario.stepAt(3_150.0, PowertrainType.COMBUSTION)!!
+        assertEquals(145, accelDecel.targetSpeedKmh)
+        assertEquals(110, accelDecel.decelTargetKmh)
+        assertEquals(AccelerationMethod.WOT, accelDecel.accelerationMethod)
+    }
+
+    @Test
+    fun hybridRestartsFromAAfterThreeThousandKm() {
+        val restartedA = KatriDrivingScenario.stepAt(3_000.0, PowertrainType.HYBRID)!!
+        assertEquals("A-1", restartedA.id)
+        assertEquals(60, restartedA.targetSpeedKmh)
+        assertEquals(3_100.0, restartedA.endKm, 0.0)
+
+        val secondCycleA = KatriDrivingScenario.stepAt(5_000.0, PowertrainType.HYBRID)!!
+        assertEquals("A-1", secondCycleA.id)
+        assertEquals(5_100.0, secondCycleA.endKm, 0.0)
     }
 }

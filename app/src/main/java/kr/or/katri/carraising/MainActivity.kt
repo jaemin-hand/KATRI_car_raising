@@ -9,6 +9,7 @@ import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.PointF
 import android.graphics.Typeface
+import android.media.AudioAttributes
 import android.media.AudioManager
 import android.media.ToneGenerator
 import android.location.Location
@@ -18,6 +19,8 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
 import android.text.InputType
 import android.view.Gravity
 import android.view.View
@@ -40,7 +43,7 @@ import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sqrt
 
-private enum class Screen { Home, Preparation, Track }
+private enum class Screen { Home, Preparation, PowertrainSelection, Track }
 private enum class SessionState { Idle, Ready, Running, Paused, Finished }
 private enum class DrivingActionState { CRUISING, WAITING_FOR_BRAKE_LINE, DECELERATING, ACCELERATING }
 
@@ -114,12 +117,20 @@ class MainActivity : Activity() {
     private var tvScenarioInstruction: TextView? = null
     private var redFlashOverlay: View? = null
     private var lapAlarmTone: ToneGenerator? = null
+    private var textToSpeech: TextToSpeech? = null
+    private var isTextToSpeechReady = false
+    private var isTextToSpeechInitializationFinished = false
+    private var isBrakeVoiceActive = false
+    private var brakeVoiceTargetKmh: Int? = null
+    private var brakeVoiceUtteranceSequence = 0L
+    private var currentBrakeVoiceUtteranceId: String? = null
+    private var hasShownVoiceUnavailableToast = false
 
     private var btnSetBrakeLine: Button? = null
     private var btnStartPause: Button? = null
     private var btnStop: Button? = null
 
-    private var selectedVehicle = "차량 A"
+    private var selectedPowertrain: PowertrainType? = null
     private var selectedTestMode = "9000km 고주로 주행"
     private var selectedStartOdo = ""
     private var selectedTrackOdo = ""
@@ -129,6 +140,7 @@ class MainActivity : Activity() {
     private val brakeLineDetectionHalfWidthM = 25.0
     private val brakeLineHalfLengthM = 60.0
     private val speedTargetToleranceKmh = 3.0
+    private val brakeVoiceRepeatDelayMs = 1_000L
     private val routePointMinSpacingM = 3.0
     private val stationaryDistanceM = 4.0
     private val minimumMovingSpeedKmh = 0.8
@@ -153,11 +165,16 @@ class MainActivity : Activity() {
         }
     }
 
+    private val brakeVoiceRepeatRunnable = Runnable {
+        speakBrakeInstructionIfNeeded()
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         loadReferenceRoute()
         loadBrakeLine()
         initLocationListener()
+        initTextToSpeech()
         showHome()
     }
 
@@ -169,6 +186,7 @@ class MainActivity : Activity() {
             startLocationUpdates()
         }
         updateTrackUi()
+        resumeBrakeAlertIfNeeded()
     }
 
     override fun onPause() {
@@ -180,6 +198,9 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         stopRedFlashLoop()
+        textToSpeech?.shutdown()
+        textToSpeech = null
+        isTextToSpeechReady = false
         lapAlarmTone?.release()
         lapAlarmTone = null
         super.onDestroy()
@@ -187,6 +208,147 @@ class MainActivity : Activity() {
 
     override fun onBackPressed() {
         if (currentScreen == Screen.Home) super.onBackPressed() else showHome()
+    }
+
+    private fun initTextToSpeech() {
+        textToSpeech = TextToSpeech(this) { status ->
+            isTextToSpeechInitializationFinished = true
+            val engine = textToSpeech
+            if (status == TextToSpeech.SUCCESS && engine != null) {
+                val languageResult = engine.setLanguage(Locale.KOREAN)
+                isTextToSpeechReady = languageResult != TextToSpeech.LANG_MISSING_DATA &&
+                    languageResult != TextToSpeech.LANG_NOT_SUPPORTED
+                if (isTextToSpeechReady) {
+                    engine.setSpeechRate(0.95f)
+                    engine.setAudioAttributes(
+                        AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                            .build()
+                    )
+                    engine.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                        override fun onStart(utteranceId: String?) = Unit
+
+                        override fun onDone(utteranceId: String?) {
+                            onBrakeVoiceUtteranceFinished(utteranceId, failed = false)
+                        }
+
+                        @Deprecated("Deprecated in Android")
+                        override fun onError(utteranceId: String?) {
+                            onBrakeVoiceUtteranceFinished(utteranceId, failed = true)
+                        }
+                    })
+                }
+            } else {
+                isTextToSpeechReady = false
+            }
+
+            uiHandler.post {
+                if (isBrakeVoiceActive) speakBrakeInstructionIfNeeded()
+            }
+        }
+    }
+
+    private fun startBrakeVoicePrompt(step: DrivingScenarioStep) {
+        val targetKmh = step.decelTargetKmh ?: return
+        stopBrakeVoicePrompt()
+        brakeVoiceTargetKmh = targetKmh
+        isBrakeVoiceActive = true
+        speakBrakeInstructionIfNeeded()
+    }
+
+    private fun stopBrakeVoicePrompt() {
+        uiHandler.removeCallbacks(brakeVoiceRepeatRunnable)
+        if (!isBrakeVoiceActive && currentBrakeVoiceUtteranceId == null) return
+
+        isBrakeVoiceActive = false
+        brakeVoiceTargetKmh = null
+        currentBrakeVoiceUtteranceId = null
+        textToSpeech?.stop()
+    }
+
+    private fun speakBrakeInstructionIfNeeded() {
+        uiHandler.removeCallbacks(brakeVoiceRepeatRunnable)
+        val targetKmh = brakeVoiceTargetKmh ?: return
+        val step = currentScenarioStep()
+        if (
+            !isBrakeVoiceActive ||
+            sessionState != SessionState.Running ||
+            drivingActionState != DrivingActionState.DECELERATING ||
+            step?.decelTargetKmh != targetKmh ||
+            hasReachedDecelerationTarget(targetKmh)
+        ) {
+            stopBrakeVoicePrompt()
+            return
+        }
+
+        val engine = textToSpeech
+        if (!isTextToSpeechReady || engine == null) {
+            playFallbackAlarmTone()
+            showVoiceUnavailableMessageIfNeeded()
+            uiHandler.postDelayed(brakeVoiceRepeatRunnable, brakeVoiceRepeatDelayMs)
+            return
+        }
+
+        brakeVoiceUtteranceSequence += 1L
+        val utteranceId = "brake-guidance-$brakeVoiceUtteranceSequence"
+        currentBrakeVoiceUtteranceId = utteranceId
+        val result = engine.speak(
+            brakeVoiceMessage(targetKmh),
+            TextToSpeech.QUEUE_FLUSH,
+            null,
+            utteranceId
+        )
+        if (result == TextToSpeech.ERROR) {
+            currentBrakeVoiceUtteranceId = null
+            playFallbackAlarmTone()
+            uiHandler.postDelayed(brakeVoiceRepeatRunnable, brakeVoiceRepeatDelayMs)
+        }
+    }
+
+    private fun onBrakeVoiceUtteranceFinished(utteranceId: String?, failed: Boolean) {
+        uiHandler.post {
+            if (!isBrakeVoiceActive || utteranceId != currentBrakeVoiceUtteranceId) return@post
+            currentBrakeVoiceUtteranceId = null
+            if (failed) playFallbackAlarmTone()
+            uiHandler.removeCallbacks(brakeVoiceRepeatRunnable)
+            uiHandler.postDelayed(brakeVoiceRepeatRunnable, brakeVoiceRepeatDelayMs)
+        }
+    }
+
+    private fun brakeVoiceMessage(targetKmh: Int): String {
+        return if (targetKmh <= 0) {
+            "완전히 정차하세요."
+        } else {
+            "시속 ${targetKmh}킬로미터까지 감속하세요."
+        }
+    }
+
+    private fun showVoiceUnavailableMessageIfNeeded() {
+        if (!isTextToSpeechInitializationFinished || hasShownVoiceUnavailableToast) return
+        hasShownVoiceUnavailableToast = true
+        Toast.makeText(this, "한국어 음성 안내를 사용할 수 없어 경고음으로 알립니다.", Toast.LENGTH_LONG).show()
+    }
+
+    private fun playFallbackAlarmTone() {
+        if (lapAlarmTone == null) {
+            lapAlarmTone = ToneGenerator(AudioManager.STREAM_ALARM, 100)
+        }
+        lapAlarmTone?.startTone(ToneGenerator.TONE_PROP_BEEP, 500)
+    }
+
+    private fun resumeBrakeAlertIfNeeded() {
+        if (
+            currentScreen != Screen.Track ||
+            sessionState != SessionState.Running ||
+            drivingActionState != DrivingActionState.DECELERATING
+        ) return
+
+        val step = currentScenarioStep() ?: return
+        val targetKmh = step.decelTargetKmh ?: return
+        if (hasReachedDecelerationTarget(targetKmh)) return
+        startRedFlashLoop()
+        if (!isBrakeVoiceActive) startBrakeVoicePrompt(step)
     }
 
     private fun initLocationListener() {
@@ -377,6 +539,7 @@ class MainActivity : Activity() {
         redFlashOverlay?.animate()?.cancel()
         redFlashOverlay?.alpha = 0f
         redFlashOverlay?.visibility = View.GONE
+        stopBrakeVoicePrompt()
     }
 
     private fun runRedFlashPulse() {
@@ -416,7 +579,7 @@ class MainActivity : Activity() {
             val step = currentScenarioStep()
             if (step?.driveMode == ScenarioDriveMode.ACCEL_DECEL) {
                 drivingActionState = DrivingActionState.DECELERATING
-                triggerLapAlarm()
+                triggerLapAlarm(step)
             } else {
                 drivingActionState = DrivingActionState.CRUISING
             }
@@ -425,12 +588,9 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun triggerLapAlarm() {
+    private fun triggerLapAlarm(step: DrivingScenarioStep) {
         startRedFlashLoop()
-        if (lapAlarmTone == null) {
-            lapAlarmTone = ToneGenerator(AudioManager.STREAM_ALARM, 100)
-        }
-        lapAlarmTone?.startTone(ToneGenerator.TONE_PROP_BEEP, 700)
+        startBrakeVoicePrompt(step)
     }
 
     private fun isInBrakeLineGate(location: Location): Boolean {
@@ -633,7 +793,8 @@ class MainActivity : Activity() {
     }
 
     private fun currentScenarioStep(): DrivingScenarioStep? {
-        return KatriDrivingScenario.stepAt(testProgressDistanceKm())
+        val powertrain = selectedPowertrain ?: return null
+        return KatriDrivingScenario.stepAt(testProgressDistanceKm(), powertrain)
     }
 
     private fun syncScenarioState() {
@@ -648,6 +809,14 @@ class MainActivity : Activity() {
         stopRedFlashLoop()
     }
 
+    private fun hasReachedDecelerationTarget(targetKmh: Int): Boolean {
+        return if (targetKmh <= 0) {
+            currentSpeedKmh <= 0.0
+        } else {
+            currentSpeedKmh <= targetKmh + speedTargetToleranceKmh
+        }
+    }
+
     private fun updateDrivingActionState() {
         if (sessionState != SessionState.Running) return
         val step = currentScenarioStep() ?: return
@@ -660,7 +829,7 @@ class MainActivity : Activity() {
         when (drivingActionState) {
             DrivingActionState.DECELERATING -> {
                 val target = step.decelTargetKmh ?: return
-                if (currentSpeedKmh <= target + speedTargetToleranceKmh) {
+                if (hasReachedDecelerationTarget(target)) {
                     drivingActionState = DrivingActionState.ACCELERATING
                     stopRedFlashLoop()
                 }
@@ -675,7 +844,7 @@ class MainActivity : Activity() {
     }
 
     private fun scenarioInstruction(step: DrivingScenarioStep?): String {
-        if (step == null) return "3000km 이후 차종별 시나리오가 아직 설정되지 않았습니다."
+        if (step == null) return "9000km 시험이 완료되었거나 적용할 시나리오가 없습니다."
         if (step.driveMode == ScenarioDriveMode.CONSTANT) {
             return "${step.targetSpeedKmh}km/h 정속 유지 · 감속 없음"
         }
@@ -712,7 +881,17 @@ class MainActivity : Activity() {
         setContentView(createPreparationView())
     }
 
+    private fun showPowertrainSelection() {
+        stopRedFlashLoop()
+        currentScreen = Screen.PowertrainSelection
+        setContentView(createPowertrainSelectionView())
+    }
+
     private fun showTrack() {
+        if (selectedPowertrain == null) {
+            showPowertrainSelection()
+            return
+        }
         currentScreen = Screen.Track
         setContentView(createTrackView())
         if (hasLocationPermission()) startLocationUpdates() else requestLocationPermission { startLocationUpdates() }
@@ -735,7 +914,7 @@ class MainActivity : Activity() {
             gravity = Gravity.CENTER
         }
         val subtitle = TextView(this).apply {
-            text = "거리 / 속도 / 랩 카운트"
+            text = "GPS 주행 / 시나리오 안내"
             textSize = 15f
             setTextColor(ScreenColors.MutedText)
             gravity = Gravity.CENTER
@@ -748,15 +927,47 @@ class MainActivity : Activity() {
             largeButton()
         )
         root.addView(
-            primaryButton("고주로 주행") { showTrack() },
+            primaryButton("고주로 주행") { showPowertrainSelection() },
             largeButton()
         )
         return root
     }
 
+    private fun createPowertrainSelectionView(): LinearLayout {
+        val root = screenRoot()
+        root.addView(toolbar("차량 유형 선택", "고주로 주행 시나리오"))
+
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setPadding(dp(24), dp(24), dp(24), dp(24))
+        }
+        content.addView(
+            primaryButton("내연기관") {
+                selectPowertrainAndShowTrack(PowertrainType.COMBUSTION)
+            },
+            largeButton()
+        )
+        content.addView(
+            primaryButton("하이브리드 차량") {
+                selectPowertrainAndShowTrack(PowertrainType.HYBRID)
+            },
+            largeButton()
+        )
+        root.addView(content, weightedContent())
+        return root
+    }
+
+    private fun selectPowertrainAndShowTrack(powertrainType: PowertrainType) {
+        selectedPowertrain = powertrainType
+        activeScenarioStepId = null
+        drivingActionState = DrivingActionState.CRUISING
+        showTrack()
+    }
+
     private fun createPreparationView(): LinearLayout {
         val root = screenRoot()
-        root.addView(toolbar("시험 준비", "차량 및 시험 방식"))
+        root.addView(toolbar("시험 준비", "시험 방식 및 체크리스트"))
 
         val scroll = ScrollView(this)
         val content = LinearLayout(this).apply {
@@ -764,9 +975,7 @@ class MainActivity : Activity() {
             setPadding(dp(16), dp(14), dp(16), dp(24))
         }
 
-        content.addView(sectionTitle("차량 / 시험"))
-        content.addView(formLabel("차량"))
-        content.addView(spinnerOf("차량", "차량 A", "차량 B", "차량 C") { selectedVehicle = it })
+        content.addView(sectionTitle("시험"))
         content.addView(formLabel("시험 방식"))
         content.addView(
             spinnerOf("시험 방식", "9000km 고주로 주행", "단거리 주행", "사용자 설정") {
@@ -806,7 +1015,7 @@ class MainActivity : Activity() {
                     Toast.makeText(this, "필수 체크리스트를 먼저 완료하세요. (${remaining}개 남음)", Toast.LENGTH_SHORT).show()
                     return@primaryButton
                 }
-                showTrack()
+                showPowertrainSelection()
             },
             compactFullWidth()
         )
@@ -821,7 +1030,7 @@ class MainActivity : Activity() {
             layoutParams = matchParent()
         }
         val root = screenRoot()
-        root.addView(toolbar("고주로 주행", "$selectedVehicle / $selectedTestMode"))
+        root.addView(toolbar("고주로 주행", "${selectedPowertrain?.label} / $selectedTestMode"))
 
         val scroll = ScrollView(this)
         val content = LinearLayout(this).apply {
@@ -1061,6 +1270,7 @@ class MainActivity : Activity() {
         updateControlButtons()
         tvStatus?.text = currentStatusLabel()
         updateTrackUi()
+        resumeBrakeAlertIfNeeded()
     }
 
     private fun stopSession() {
@@ -1160,7 +1370,7 @@ class MainActivity : Activity() {
         tvBrakeLine?.text = brakeLineStatusLabel(scenarioStep)
         if (scenarioStep == null) {
             tvScenarioSection?.text = "시나리오 미설정"
-            tvScenarioProgress?.text = String.format(Locale.US, "현재 %.1fkm · 설정 범위 0~3000km", progressDistanceKm)
+            tvScenarioProgress?.text = String.format(Locale.US, "현재 %.1fkm · 시험 범위 0~9000km", progressDistanceKm)
             tvScenarioTarget?.text = "규정속도 -"
         } else {
             val nextTransitionKm = max(0.0, scenarioStep.endKm - progressDistanceKm)
