@@ -74,13 +74,7 @@ class MainActivity : Activity() {
     private var previousLocation: Location? = null
     private var previousLocationUpdateMs = 0L
 
-    private var sessionStartRealtimeMs = 0L
-    private var sessionPausedAccumMs = 0L
-    private var sessionPausedAtMs = 0L
-
     private var totalDistanceM = 0.0
-    private var lapStartDistanceM = 0.0
-    private var lapCount = 0
     private var lastGateDistanceM = 0.0
     private var wasInBrakeLineGate = false
     private var currentSpeedKmh = 0.0
@@ -111,10 +105,6 @@ class MainActivity : Activity() {
     private var previewView: TrackPreviewView? = null
     private var tvSpeed: TextView? = null
     private var tvDistance: TextView? = null
-    private var tvLap: TextView? = null
-    private var tvLapProgress: TextView? = null
-    private var tvRemain: TextView? = null
-    private var tvElapsed: TextView? = null
     private var tvStatus: TextView? = null
     private var tvBoundary: TextView? = null
     private var tvBrakeLine: TextView? = null
@@ -134,7 +124,6 @@ class MainActivity : Activity() {
     private var selectedStartOdo = ""
     private var selectedTrackOdo = ""
 
-    private val targetDistanceKm = 9000.0
     private val gpsGateMinDistanceM = 4_000.0
     private val brakeLineFallbackRadiusM = 45.0
     private val brakeLineDetectionHalfWidthM = 25.0
@@ -419,8 +408,6 @@ class MainActivity : Activity() {
         val inGate = isInBrakeLineGate(location)
         val traveledFromLastGate = totalDistanceM - lastGateDistanceM
         if (!wasInBrakeLineGate && inGate && traveledFromLastGate >= gpsGateMinDistanceM) {
-            lapCount += 1
-            lapStartDistanceM = totalDistanceM
             lastGateDistanceM = totalDistanceM
             wasInBrakeLineGate = true
             saveReferenceRouteIfReady()
@@ -706,23 +693,6 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun targetDistanceKmForCurrentMode(): Double {
-        return when (selectedTestMode) {
-            "단거리 주행" -> 5.0
-            else -> targetDistanceKm
-        }
-    }
-
-    private fun elapsedSessionSeconds(): Long {
-        val now = SystemClock.elapsedRealtime()
-        if (sessionStartRealtimeMs <= 0L) return 0L
-        return when (sessionState) {
-            SessionState.Running -> max(0L, (now - sessionStartRealtimeMs - sessionPausedAccumMs) / 1000L)
-            SessionState.Paused -> max(0L, (sessionPausedAtMs - sessionStartRealtimeMs - sessionPausedAccumMs) / 1000L)
-            else -> 0L
-        }
-    }
-
     private fun currentStatusLabel(): String = when (sessionState) {
         SessionState.Idle -> "상태: 대기"
         SessionState.Ready -> "상태: 대기"
@@ -884,17 +854,11 @@ class MainActivity : Activity() {
 
         tvSpeed = metricTextView("0.0 km/h")
         tvDistance = metricTextView("0.00 km")
-        tvLap = metricTextView("0")
-        tvLapProgress = metricTextView("0.00 km")
-        tvRemain = metricTextView("0.0 / ${targetDistanceKmForCurrentMode()} km")
-        tvElapsed = metricTextView("00:00:00")
         tvStatus = metricTextView(currentStatusLabel())
         tvBoundary = metricTextView("고주로: 확인 중")
         tvBrakeLine = metricTextView("브레이크 시작선: 미설정")
 
         content.addView(metricRow(metricCard("속도", tvSpeed!!), metricCard("시험 누적거리", tvDistance!!)))
-        content.addView(metricRow(metricCard("랩 수", tvLap!!), metricCard("현재 랩 거리", tvLapProgress!!)))
-        content.addView(metricRow(metricCard("경과시간", tvElapsed!!), metricCard("남은 거리", tvRemain!!)))
         content.addView(tvStatus)
         content.addView(space(dp(6)))
         content.addView(tvBoundary)
@@ -1061,25 +1025,17 @@ class MainActivity : Activity() {
         if (sessionState == SessionState.Idle || sessionState == SessionState.Ready || sessionState == SessionState.Finished) {
             stopRedFlashLoop()
             totalDistanceM = 0.0
-            lapCount = 0
-            lapStartDistanceM = 0.0
             lastGateDistanceM = 0.0
             currentSpeedKmh = 0.0
             odoConfirmedAtSessionDistanceM = 0.0
             activeScenarioStepId = null
             drivingActionState = DrivingActionState.CRUISING
-            sessionStartRealtimeMs = SystemClock.elapsedRealtime()
-            sessionPausedAccumMs = 0L
-            sessionPausedAtMs = 0L
             previewView?.clearPath()
             currentRoutePoints.clear()
             currentLocation?.let { appendCurrentRoutePoint(it, force = true) }
             wasInBrakeLineGate = true
             previousLocation = currentLocation
             previousLocationUpdateMs = SystemClock.elapsedRealtime()
-        } else if (sessionState == SessionState.Paused) {
-            sessionPausedAccumMs += max(1L, SystemClock.elapsedRealtime() - sessionPausedAtMs)
-            sessionPausedAtMs = 0L
         }
 
         wasInBrakeLineGate = isInBrakeLineGate(currentLocation ?: brakeLineLocation!!)
@@ -1092,7 +1048,6 @@ class MainActivity : Activity() {
     private fun pauseSession() {
         if (sessionState != SessionState.Running) return
         sessionState = SessionState.Paused
-        sessionPausedAtMs = SystemClock.elapsedRealtime()
         currentSpeedKmh = 0.0
         stopRedFlashLoop()
         updateControlButtons()
@@ -1102,8 +1057,6 @@ class MainActivity : Activity() {
 
     private fun resumeSession() {
         if (sessionState != SessionState.Paused) return
-        sessionPausedAccumMs += max(1L, SystemClock.elapsedRealtime() - sessionPausedAtMs)
-        sessionPausedAtMs = 0L
         sessionState = SessionState.Running
         updateControlButtons()
         tvStatus?.text = currentStatusLabel()
@@ -1123,8 +1076,6 @@ class MainActivity : Activity() {
 
     private fun resetToReady() {
         totalDistanceM = 0.0
-        lapCount = 0
-        lapStartDistanceM = 0.0
         lastGateDistanceM = 0.0
         wasInBrakeLineGate = false
         currentSpeedKmh = 0.0
@@ -1150,8 +1101,6 @@ class MainActivity : Activity() {
             saveBrakeLine()
             sessionState = SessionState.Ready
             totalDistanceM = 0.0
-            lapCount = 0
-            lapStartDistanceM = 0.0
             lastGateDistanceM = 0.0
             wasInBrakeLineGate = true
             currentSpeedKmh = 0.0
@@ -1159,9 +1108,6 @@ class MainActivity : Activity() {
             activeScenarioStepId = null
             drivingActionState = DrivingActionState.CRUISING
             stopRedFlashLoop()
-            sessionStartRealtimeMs = 0L
-            sessionPausedAccumMs = 0L
-            sessionPausedAtMs = 0L
             currentRoutePoints.clear()
             previewView?.clearPath()
             previewView?.setBrakeLine(now.latitude, now.longitude)
@@ -1202,20 +1148,13 @@ class MainActivity : Activity() {
         }
 
         val location = currentLocation
-        val lapDistanceKm = max(0.0, totalDistanceM - lapStartDistanceM) / 1000.0
-        val targetKm = targetDistanceKmForCurrentMode()
         val progressDistanceKm = testProgressDistanceKm()
-        val remainKm = if (targetKm > 0.0) max(0.0, targetKm - progressDistanceKm) else 0.0
         syncScenarioState()
         updateDrivingActionState()
         val scenarioStep = currentScenarioStep()
 
         tvSpeed?.text = String.format(Locale.US, "%.1f km/h", currentSpeedKmh)
         tvDistance?.text = String.format(Locale.US, "%.2f km", progressDistanceKm)
-        tvLap?.text = lapCount.toString()
-        tvLapProgress?.text = String.format(Locale.US, "%.2f km", lapDistanceKm)
-        tvRemain?.text = String.format(Locale.US, "%.1f / %.1f km", progressDistanceKm, remainKm)
-        tvElapsed?.text = String.format(Locale.US, "%02d:%02d:%02d", elapsedSessionSeconds() / 3600, (elapsedSessionSeconds() % 3600) / 60, elapsedSessionSeconds() % 60)
         tvStatus?.text = currentStatusLabel()
         tvBoundary?.text = trackAreaLabel()
         tvBrakeLine?.text = brakeLineStatusLabel(scenarioStep)
