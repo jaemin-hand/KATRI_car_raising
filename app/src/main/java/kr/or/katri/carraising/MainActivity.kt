@@ -25,6 +25,7 @@ import android.text.InputType
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.view.inputmethod.InputMethodManager
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
 import android.widget.Button
@@ -1156,38 +1157,74 @@ class MainActivity : Activity() {
         content.addView(formLabel("현재 ODO"))
         val trackOdoInput = numberInput("ODO (km)")
         val initialTrackOdo = selectedTrackOdo.ifEmpty { selectedStartOdo }
-        val trackOdoSavedText = summaryText(savedOdoLabel(initialTrackOdo))
+        val trackOdoSavedText = TextView(this).apply {
+            text = savedOdoLabel(initialTrackOdo)
+            textSize = 16f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(ScreenColors.Text)
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(14), 0, dp(14), 0)
+        }
         if (initialTrackOdo.isNotEmpty()) {
             trackOdoInput.setText(initialTrackOdo)
             trackOdoInput.setSelection(trackOdoInput.text.length)
+        }
+        var isTrackOdoEditing = initialTrackOdo.isEmpty()
+        val trackOdoActionButton = secondaryButton("") {}
+        val updateTrackOdoMode = {
+            trackOdoInput.visibility = if (isTrackOdoEditing) View.VISIBLE else View.GONE
+            trackOdoSavedText.visibility = if (isTrackOdoEditing) View.GONE else View.VISIBLE
+            trackOdoActionButton.text = if (isTrackOdoEditing) "확인" else "편집"
+        }
+        trackOdoActionButton.setOnClickListener {
+            if (!isTrackOdoEditing) {
+                isTrackOdoEditing = true
+                val savedOdo = selectedTrackOdo.ifEmpty { selectedStartOdo }
+                trackOdoInput.setText(savedOdo)
+                trackOdoInput.setSelection(trackOdoInput.text.length)
+                updateTrackOdoMode()
+                trackOdoInput.post {
+                    trackOdoInput.requestFocus()
+                    (getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager)
+                        .showSoftInput(trackOdoInput, InputMethodManager.SHOW_IMPLICIT)
+                }
+                return@setOnClickListener
+            }
+
+            val enteredText = trackOdoInput.text.toString().trim()
+            val enteredOdo = enteredText.toDoubleOrNull()
+            if (enteredOdo == null || enteredOdo < 0.0) {
+                Toast.makeText(this@MainActivity, "올바른 ODO 값을 입력하세요.", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            val startOdo = selectedStartOdo.toDoubleOrNull()
+            if (startOdo != null && enteredOdo < startOdo) {
+                Toast.makeText(this@MainActivity, "현재 ODO는 시작 ODO보다 작을 수 없습니다.", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+
+            selectedTrackOdo = enteredText
+            odoConfirmedAtSessionDistanceM = totalDistanceM
+            activeScenarioStepId = null
+            syncScenarioState()
+            trackOdoSavedText.text = savedOdoLabel(selectedTrackOdo)
+            isTrackOdoEditing = false
+            trackOdoInput.clearFocus()
+            (getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager)
+                .hideSoftInputFromWindow(trackOdoInput.windowToken, 0)
+            updateTrackOdoMode()
+            updateTrackUi()
+            Toast.makeText(this@MainActivity, "ODO가 저장되었습니다.", Toast.LENGTH_SHORT).show()
         }
         val trackOdoRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             addView(trackOdoInput, LinearLayout.LayoutParams(0, dp(52), 1f).apply { rightMargin = dp(8) })
-            addView(secondaryButton("확인") {
-                val enteredText = trackOdoInput.text.toString().trim()
-                val enteredOdo = enteredText.toDoubleOrNull()
-                if (enteredOdo == null || enteredOdo < 0.0) {
-                    Toast.makeText(this@MainActivity, "올바른 ODO 값을 입력하세요.", Toast.LENGTH_SHORT).show()
-                    return@secondaryButton
-                }
-                val startOdo = selectedStartOdo.toDoubleOrNull()
-                if (startOdo != null && enteredOdo < startOdo) {
-                    Toast.makeText(this@MainActivity, "현재 ODO는 시작 ODO보다 작을 수 없습니다.", Toast.LENGTH_SHORT).show()
-                    return@secondaryButton
-                }
-                selectedTrackOdo = enteredText
-                odoConfirmedAtSessionDistanceM = totalDistanceM
-                activeScenarioStepId = null
-                syncScenarioState()
-                trackOdoSavedText.text = savedOdoLabel(selectedTrackOdo)
-                updateTrackUi()
-                Toast.makeText(this@MainActivity, "ODO가 저장되었습니다.", Toast.LENGTH_SHORT).show()
-            }, LinearLayout.LayoutParams(dp(112), dp(52)))
+            addView(trackOdoSavedText, LinearLayout.LayoutParams(0, dp(52), 1f).apply { rightMargin = dp(8) })
+            addView(trackOdoActionButton, LinearLayout.LayoutParams(dp(112), dp(52)))
         }
+        updateTrackOdoMode()
         content.addView(trackOdoRow)
-        content.addView(trackOdoSavedText)
         content.addView(space(dp(10)))
 
         btnSetBrakeLine = secondaryButton("현재 위치를 브레이크 시작선으로 설정") {
