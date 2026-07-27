@@ -64,6 +64,11 @@ private data class BrakeLineFrame(
     val tangentNorth: Double
 )
 
+private data class SpeedSample(
+    val speedKmh: Double,
+    val isValidForControl: Boolean
+)
+
 class MainActivity : Activity() {
     private val permissionRequestCode = 1001
     private val locationManager: LocationManager by lazy { getSystemService(LOCATION_SERVICE) as LocationManager }
@@ -81,6 +86,7 @@ class MainActivity : Activity() {
     private var lastGateDistanceM = 0.0
     private var wasInBrakeLineGate = false
     private var currentSpeedKmh = 0.0
+    private var latestRawSpeedKmh: Double? = null
     private var insideTrackArea = true
     private var brakeLineLocation: Location? = null
     private var activeScenarioStepId: String? = null
@@ -140,6 +146,8 @@ class MainActivity : Activity() {
     private val brakeLineDetectionHalfWidthM = 25.0
     private val brakeLineHalfLengthM = 60.0
     private val speedTargetToleranceKmh = 3.0
+    private val locationUpdateIntervalMs = 500L
+    private val locationUpdateMinDistanceM = 1f
     private val brakeVoiceRepeatDelayMs = 1_000L
     private val routePointMinSpacingM = 3.0
     private val stationaryDistanceM = 4.0
@@ -423,7 +431,13 @@ class MainActivity : Activity() {
             return
         }
 
-        locationManager.requestLocationUpdates(provider, 1_000L, 1f, listener, mainLooper)
+        locationManager.requestLocationUpdates(
+            provider,
+            locationUpdateIntervalMs,
+            locationUpdateMinDistanceM,
+            listener,
+            mainLooper
+        )
         isLocationListening = true
         locationManager.getLastKnownLocation(provider)?.let { onLocationUpdated(it) }
     }
@@ -442,7 +456,9 @@ class MainActivity : Activity() {
             val dtMs = max(1L, nowMs - previousLocationUpdateMs)
             val deltaM = prev.distanceTo(location).coerceAtLeast(0f).toDouble()
             val dtSec = dtMs / 1000.0
-            currentSpeedKmh = smoothSpeedKmh(calculateRawSpeedKmh(prev, location, dtSec, deltaM))
+            val speedSample = calculateSpeedSample(prev, location, dtSec, deltaM)
+            latestRawSpeedKmh = speedSample.speedKmh.takeIf { speedSample.isValidForControl }
+            currentSpeedKmh = smoothSpeedKmh(speedSample.speedKmh)
             val acceptedDeltaM = if (shouldAcceptMovement(location, deltaM, currentSpeedKmh)) deltaM else 0.0
 
             if (sessionState == SessionState.Running && acceptedDeltaM > 0.0) {
@@ -462,7 +478,9 @@ class MainActivity : Activity() {
             previousLocationUpdateMs = nowMs
         } else {
             previousLocationUpdateMs = nowMs
-            currentSpeedKmh = smoothSpeedKmh(calculateRawSpeedKmh(null, location, 0.0, 0.0))
+            val speedSample = calculateSpeedSample(null, location, 0.0, 0.0)
+            latestRawSpeedKmh = speedSample.speedKmh.takeIf { speedSample.isValidForControl }
+            currentSpeedKmh = smoothSpeedKmh(speedSample.speedKmh)
         }
 
         previousLocation = prev ?: location
@@ -476,8 +494,13 @@ class MainActivity : Activity() {
         updateTrackUi()
     }
 
-    private fun calculateRawSpeedKmh(prev: Location?, location: Location, dtSec: Double, deltaM: Double): Double {
-        if (!isUsableLocation(location)) return 0.0
+    private fun calculateSpeedSample(
+        prev: Location?,
+        location: Location,
+        dtSec: Double,
+        deltaM: Double
+    ): SpeedSample {
+        if (!isUsableLocation(location)) return SpeedSample(0.0, isValidForControl = false)
 
         val hasTrustedGpsSpeed = isTrustedGpsSpeed(location)
         val gpsSpeedKmh = if (hasTrustedGpsSpeed) {
@@ -497,8 +520,27 @@ class MainActivity : Activity() {
         }
 
         val rawSpeedKmh = gpsSpeedKmh ?: distanceSpeedKmh ?: 0.0
-        if (!hasTrustedGpsSpeed && prev != null && deltaM < stationaryDistanceM && rawSpeedKmh < lowSpeedGpsJitterKmh) return 0.0
-        return if (rawSpeedKmh < minimumMovingSpeedKmh) 0.0 else rawSpeedKmh
+        val hasStationaryEvidence =
+            prev != null &&
+                isUsableLocation(prev) &&
+                dtSec >= minSpeedSampleSeconds &&
+                deltaM < stationaryDistanceM
+        val normalizedSpeedKmh = if (
+            !hasTrustedGpsSpeed &&
+            prev != null &&
+            deltaM < stationaryDistanceM &&
+            rawSpeedKmh < lowSpeedGpsJitterKmh
+        ) {
+            0.0
+        } else if (rawSpeedKmh < minimumMovingSpeedKmh) {
+            0.0
+        } else {
+            rawSpeedKmh
+        }
+        return SpeedSample(
+            speedKmh = normalizedSpeedKmh,
+            isValidForControl = gpsSpeedKmh != null || distanceSpeedKmh != null || hasStationaryEvidence
+        )
     }
 
     private fun smoothSpeedKmh(rawSpeedKmh: Double): Double {
@@ -810,11 +852,12 @@ class MainActivity : Activity() {
     }
 
     private fun hasReachedDecelerationTarget(targetKmh: Int): Boolean {
-        return if (targetKmh <= 0) {
-            currentSpeedKmh <= 0.0
-        } else {
-            currentSpeedKmh <= targetKmh + speedTargetToleranceKmh
-        }
+        return DrivingSpeedRules.hasReachedDecelerationTarget(
+            targetKmh = targetKmh,
+            displayedSpeedKmh = currentSpeedKmh,
+            latestRawSpeedKmh = latestRawSpeedKmh,
+            toleranceKmh = speedTargetToleranceKmh
+        )
     }
 
     private fun updateDrivingActionState() {
@@ -898,13 +941,15 @@ class MainActivity : Activity() {
         updateTrackUi()
     }
 
-    private fun createHomeView(): LinearLayout {
-        val root = LinearLayout(this).apply {
+    private fun createHomeView(): FrameLayout {
+        val root = FrameLayout(this).apply {
+            setBackgroundColor(ScreenColors.Background)
+            layoutParams = matchParent()
+        }
+        val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
-            setBackgroundColor(ScreenColors.Background)
             setPadding(dp(24), dp(32), dp(24), dp(32))
-            layoutParams = matchParent()
         }
         val title = TextView(this).apply {
             text = getString(R.string.app_name)
@@ -919,16 +964,35 @@ class MainActivity : Activity() {
             setTextColor(ScreenColors.MutedText)
             gravity = Gravity.CENTER
         }
-        root.addView(title, fullWidth())
-        root.addView(subtitle, fullWidth())
-        root.addView(space(dp(42)))
-        root.addView(
-            primaryButton("시험 준비") { showPreparation() },
-            largeButton()
-        )
-        root.addView(
+        content.addView(title, fullWidth())
+        content.addView(subtitle, fullWidth())
+        content.addView(space(dp(42)))
+        content.addView(
             primaryButton("고주로 주행") { showPowertrainSelection() },
             largeButton()
+        )
+        root.addView(content, matchParent())
+
+        val preparationGuideButton = secondaryButton("시험 준비 가이드") {
+            showPreparation()
+        }.apply {
+            textSize = 13f
+            minWidth = 0
+            minimumWidth = 0
+            minHeight = 0
+            minimumHeight = 0
+            setPadding(dp(12), 0, dp(12), 0)
+        }
+        root.addView(
+            preparationGuideButton,
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                dp(44),
+                Gravity.TOP or Gravity.END
+            ).apply {
+                topMargin = dp(20)
+                rightMargin = dp(20)
+            }
         )
         return root
     }
@@ -967,7 +1031,7 @@ class MainActivity : Activity() {
 
     private fun createPreparationView(): LinearLayout {
         val root = screenRoot()
-        root.addView(toolbar("시험 준비", "시험 방식 및 체크리스트"))
+        root.addView(toolbar("시험 준비 가이드", "시험 방식 및 체크리스트"))
 
         val scroll = ScrollView(this)
         val content = LinearLayout(this).apply {
@@ -1236,6 +1300,7 @@ class MainActivity : Activity() {
             totalDistanceM = 0.0
             lastGateDistanceM = 0.0
             currentSpeedKmh = 0.0
+            latestRawSpeedKmh = null
             odoConfirmedAtSessionDistanceM = 0.0
             activeScenarioStepId = null
             drivingActionState = DrivingActionState.CRUISING
@@ -1277,6 +1342,7 @@ class MainActivity : Activity() {
         if (sessionState == SessionState.Idle || sessionState == SessionState.Ready) return
         sessionState = SessionState.Finished
         currentSpeedKmh = 0.0
+        latestRawSpeedKmh = null
         stopRedFlashLoop()
         tvStatus?.text = currentStatusLabel()
         updateControlButtons()
@@ -1289,6 +1355,7 @@ class MainActivity : Activity() {
         lastGateDistanceM = 0.0
         wasInBrakeLineGate = false
         currentSpeedKmh = 0.0
+        latestRawSpeedKmh = null
         odoConfirmedAtSessionDistanceM = 0.0
         activeScenarioStepId = null
         drivingActionState = DrivingActionState.CRUISING
@@ -1314,6 +1381,7 @@ class MainActivity : Activity() {
             lastGateDistanceM = 0.0
             wasInBrakeLineGate = true
             currentSpeedKmh = 0.0
+            latestRawSpeedKmh = null
             odoConfirmedAtSessionDistanceM = 0.0
             activeScenarioStepId = null
             drivingActionState = DrivingActionState.CRUISING
