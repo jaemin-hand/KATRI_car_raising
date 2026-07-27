@@ -31,6 +31,7 @@ import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.Spinner
@@ -964,6 +965,19 @@ class MainActivity : Activity() {
             setTextColor(ScreenColors.MutedText)
             gravity = Gravity.CENTER
         }
+        val logo = ImageView(this).apply {
+            setImageResource(R.drawable.app_logo)
+            scaleType = ImageView.ScaleType.FIT_CENTER
+            contentDescription = getString(R.string.app_name)
+            setPadding(dp(8), dp(8), dp(8), dp(8))
+            background = rounded(Color.WHITE, dp(8), ScreenColors.Border)
+        }
+        content.addView(
+            logo,
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(168)).apply {
+                bottomMargin = dp(18)
+            }
+        )
         content.addView(title, fullWidth())
         content.addView(subtitle, fullWidth())
         content.addView(space(dp(42)))
