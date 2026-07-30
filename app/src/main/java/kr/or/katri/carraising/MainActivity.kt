@@ -2,6 +2,11 @@ package kr.or.katri.carraising
 
 import android.Manifest
 import android.app.Activity
+import android.app.AlertDialog
+import android.content.ComponentName
+import android.content.Context
+import android.content.Intent
+import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.graphics.Canvas
 import android.graphics.Color
@@ -9,18 +14,12 @@ import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.PointF
 import android.graphics.Typeface
-import android.media.AudioAttributes
-import android.media.AudioManager
-import android.media.ToneGenerator
 import android.location.Location
-import android.location.LocationListener
-import android.location.LocationManager
 import android.os.Bundle
+import android.os.Build
 import android.os.Handler
+import android.os.IBinder
 import android.os.Looper
-import android.os.SystemClock
-import android.speech.tts.TextToSpeech
-import android.speech.tts.UtteranceProgressListener
 import android.text.InputType
 import android.view.Gravity
 import android.view.View
@@ -40,15 +39,12 @@ import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import java.util.Locale
-import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sqrt
 
 private enum class Screen { Home, Preparation, PowertrainSelection, Track }
-private enum class SessionState { Idle, Ready, Running, Paused, Finished }
-private enum class DrivingActionState { CRUISING, WAITING_FOR_BRAKE_LINE, DECELERATING, ACCELERATING }
 
 private data class PrepItem(
     val title: String,
@@ -57,42 +53,24 @@ private data class PrepItem(
     val required: Boolean = true
 )
 
-private data class GeoPoint(
-    val latitude: Double,
-    val longitude: Double
-)
-
-private data class BrakeLineFrame(
-    val tangentEast: Double,
-    val tangentNorth: Double
-)
-
-private data class SpeedSample(
-    val speedKmh: Double,
-    val isValidForControl: Boolean
-)
-
 class MainActivity : Activity() {
     private val permissionRequestCode = 1001
-    private val locationManager: LocationManager by lazy { getSystemService(LOCATION_SERVICE) as LocationManager }
-    private var locationListener: LocationListener? = null
-    private var isLocationListening = false
+    private val notificationPermissionRequestCode = 1002
+    private var trackingService: DrivingTrackingService? = null
+    private var isTrackingServiceBound = false
+    private var latestTrackingSnapshot: TrackingSnapshot? = null
+    private var lastTrackingNoticeSequence = 0L
+    private var openTrackWhenServiceConnect = false
 
     private var currentScreen = Screen.Home
     private var sessionState = SessionState.Idle
 
     private var currentLocation: Location? = null
-    private var previousLocation: Location? = null
-    private var previousLocationUpdateMs = 0L
 
     private var totalDistanceM = 0.0
-    private var lastGateDistanceM = 0.0
-    private var wasInBrakeLineGate = false
     private var currentSpeedKmh = 0.0
-    private var latestRawSpeedKmh: Double? = null
     private var insideTrackArea = true
     private var brakeLineLocation: Location? = null
-    private var activeScenarioStepId: String? = null
     private var drivingActionState = DrivingActionState.CRUISING
     private var odoConfirmedAtSessionDistanceM = 0.0
 
@@ -101,6 +79,7 @@ class MainActivity : Activity() {
     private var hasReferenceRoute = false
 
     private var pendingPermissionAction: (() -> Unit)? = null
+    private var pendingNotificationPermissionAction: (() -> Unit)? = null
 
     private val uiHandler = Handler(Looper.getMainLooper())
     private val uiUpdateRunnable = object : Runnable {
@@ -126,17 +105,9 @@ class MainActivity : Activity() {
     private var tvScenarioTarget: TextView? = null
     private var tvScenarioInstruction: TextView? = null
     private var redFlashOverlay: View? = null
-    private var lapAlarmTone: ToneGenerator? = null
-    private var textToSpeech: TextToSpeech? = null
-    private var isTextToSpeechReady = false
-    private var isTextToSpeechInitializationFinished = false
-    private var isBrakeVoiceActive = false
-    private var brakeVoiceTargetKmh: Int? = null
-    private var brakeVoiceUtteranceSequence = 0L
-    private var currentBrakeVoiceUtteranceId: String? = null
-    private var hasShownVoiceUnavailableToast = false
 
     private var btnSetBrakeLine: Button? = null
+    private var btnClearBrakeLine: Button? = null
     private var btnStartPause: Button? = null
     private var btnStop: Button? = null
 
@@ -145,30 +116,6 @@ class MainActivity : Activity() {
     private var selectedStartOdo = ""
     private var selectedTrackOdo = ""
 
-    private val gpsGateMinDistanceM = 4_000.0
-    private val brakeLineFallbackRadiusM = 45.0
-    private val brakeLineDetectionHalfWidthM = 25.0
-    private val brakeLineHalfLengthM = 60.0
-    private val speedTargetToleranceKmh = 3.0
-    private val locationUpdateIntervalMs = 500L
-    private val locationUpdateMinDistanceM = 1f
-    private val brakeVoiceRepeatDelayMs = 1_000L
-    private val routePointMinSpacingM = 3.0
-    private val stationaryDistanceM = 4.0
-    private val minimumMovingSpeedKmh = 0.8
-    private val lowSpeedGpsJitterKmh = 12.0
-    private val minSpeedSampleSeconds = 0.5
-    private val maxLocationAccuracyM = 25f
-    private val maxSpeedAccuracyMps = 1.5f
-    private val speedSmoothingAlpha = 0.35
-    private val staleSpeedTimeoutMs = 3_500L
-    private val referenceRouteToleranceM = 120.0
-    private val referenceRouteMinPoints = 80
-    private val referenceRouteMinDistanceM = 4_000.0
-    private val maxCurrentRoutePoints = 5_000
-    private val referenceRoutePrefsKey = "reference_route_points"
-    private val brakeLineLatitudePrefsKey = "brake_line_latitude"
-    private val brakeLineLongitudePrefsKey = "brake_line_longitude"
     private var isRedFlashLoopActive = false
 
     private val redFlashLoopRunnable = object : Runnable {
@@ -177,214 +124,179 @@ class MainActivity : Activity() {
         }
     }
 
-    private val brakeVoiceRepeatRunnable = Runnable {
-        speakBrakeInstructionIfNeeded()
+    private val trackingListener = TrackingListener { snapshot ->
+        runOnUiThread {
+            applyTrackingSnapshot(snapshot)
+        }
+    }
+
+    private val trackingServiceConnection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
+            val service = (binder as? DrivingTrackingService.LocalBinder)?.service() ?: return
+            trackingService = service
+            isTrackingServiceBound = true
+            service.registerListener(trackingListener)
+            if (hasLocationPermission()) service.startPreviewTracking()
+            if (service.needsForegroundRestore()) {
+                DrivingTrackingService.restoreSession(this@MainActivity)
+            }
+            selectedPowertrain?.let {
+                if (latestTrackingSnapshot?.isSessionActive != true) {
+                    service.configureSession(it, selectedStartOdo, selectedTrackOdo)
+                }
+            }
+            openRequestedTrackIfReady()
+            updateControlButtons()
+        }
+
+        override fun onServiceDisconnected(name: ComponentName?) {
+            trackingService?.unregisterListener(trackingListener)
+            trackingService = null
+            isTrackingServiceBound = false
+            updateControlButtons()
+        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        loadReferenceRoute()
-        loadBrakeLine()
-        initLocationListener()
-        initTextToSpeech()
+        openTrackWhenServiceConnect =
+            intent?.getBooleanExtra(DrivingTrackingService.EXTRA_OPEN_TRACK, false) == true
         showHome()
+    }
+
+    override fun onStart() {
+        super.onStart()
+        bindService(
+            Intent(this, DrivingTrackingService::class.java),
+            trackingServiceConnection,
+            Context.BIND_AUTO_CREATE
+        )
     }
 
     override fun onResume() {
         super.onResume()
         uiHandler.removeCallbacks(uiUpdateRunnable)
         uiHandler.post(uiUpdateRunnable)
-        if (hasLocationPermission()) {
-            startLocationUpdates()
-        }
         updateTrackUi()
-        resumeBrakeAlertIfNeeded()
+        syncRedFlashFromTrackingState()
     }
 
     override fun onPause() {
         super.onPause()
         uiHandler.removeCallbacks(uiUpdateRunnable)
         stopRedFlashLoop()
-        stopLocationUpdates()
+    }
+
+    override fun onStop() {
+        if (isTrackingServiceBound) {
+            trackingService?.unregisterListener(trackingListener)
+            unbindService(trackingServiceConnection)
+            isTrackingServiceBound = false
+            trackingService = null
+        }
+        super.onStop()
     }
 
     override fun onDestroy() {
         stopRedFlashLoop()
-        textToSpeech?.shutdown()
-        textToSpeech = null
-        isTextToSpeechReady = false
-        lapAlarmTone?.release()
-        lapAlarmTone = null
         super.onDestroy()
+    }
+
+    override fun onNewIntent(intent: Intent?) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        if (intent?.getBooleanExtra(DrivingTrackingService.EXTRA_OPEN_TRACK, false) == true) {
+            openTrackWhenServiceConnect = true
+            openRequestedTrackIfReady()
+        }
     }
 
     override fun onBackPressed() {
         if (currentScreen == Screen.Home) super.onBackPressed() else showHome()
     }
 
-    private fun initTextToSpeech() {
-        textToSpeech = TextToSpeech(this) { status ->
-            isTextToSpeechInitializationFinished = true
-            val engine = textToSpeech
-            if (status == TextToSpeech.SUCCESS && engine != null) {
-                val languageResult = engine.setLanguage(Locale.KOREAN)
-                isTextToSpeechReady = languageResult != TextToSpeech.LANG_MISSING_DATA &&
-                    languageResult != TextToSpeech.LANG_NOT_SUPPORTED
-                if (isTextToSpeechReady) {
-                    engine.setSpeechRate(0.95f)
-                    engine.setAudioAttributes(
-                        AudioAttributes.Builder()
-                            .setUsage(AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE)
-                            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                            .build()
-                    )
-                    engine.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-                        override fun onStart(utteranceId: String?) = Unit
-
-                        override fun onDone(utteranceId: String?) {
-                            onBrakeVoiceUtteranceFinished(utteranceId, failed = false)
-                        }
-
-                        @Deprecated("Deprecated in Android")
-                        override fun onError(utteranceId: String?) {
-                            onBrakeVoiceUtteranceFinished(utteranceId, failed = true)
-                        }
-                    })
+    private fun applyTrackingSnapshot(snapshot: TrackingSnapshot) {
+        latestTrackingSnapshot = snapshot
+        sessionState = snapshot.sessionState
+        if (snapshot.isSessionActive || selectedPowertrain == null) {
+            snapshot.selectedPowertrain?.let { selectedPowertrain = it }
+        }
+        if (snapshot.isSessionActive || selectedStartOdo.isEmpty()) {
+            selectedStartOdo = snapshot.selectedStartOdo
+        }
+        if (snapshot.isSessionActive || selectedTrackOdo.isEmpty()) {
+            selectedTrackOdo = snapshot.selectedTrackOdo
+        }
+        currentLocation = snapshot.currentLocation?.let { point ->
+            Location(snapshot.currentLocationProvider ?: "tracking_service").apply {
+                latitude = point.latitude
+                longitude = point.longitude
+                snapshot.currentLocationAccuracyM?.let {
+                    accuracy = it
                 }
-            } else {
-                isTextToSpeechReady = false
-            }
-
-            uiHandler.post {
-                if (isBrakeVoiceActive) speakBrakeInstructionIfNeeded()
             }
         }
-    }
-
-    private fun startBrakeVoicePrompt(step: DrivingScenarioStep) {
-        val targetKmh = step.decelTargetKmh ?: return
-        stopBrakeVoicePrompt()
-        brakeVoiceTargetKmh = targetKmh
-        isBrakeVoiceActive = true
-        speakBrakeInstructionIfNeeded()
-    }
-
-    private fun stopBrakeVoicePrompt() {
-        uiHandler.removeCallbacks(brakeVoiceRepeatRunnable)
-        if (!isBrakeVoiceActive && currentBrakeVoiceUtteranceId == null) return
-
-        isBrakeVoiceActive = false
-        brakeVoiceTargetKmh = null
-        currentBrakeVoiceUtteranceId = null
-        textToSpeech?.stop()
-    }
-
-    private fun speakBrakeInstructionIfNeeded() {
-        uiHandler.removeCallbacks(brakeVoiceRepeatRunnable)
-        val targetKmh = brakeVoiceTargetKmh ?: return
-        val step = currentScenarioStep()
-        if (
-            !isBrakeVoiceActive ||
-            sessionState != SessionState.Running ||
-            drivingActionState != DrivingActionState.DECELERATING ||
-            step?.decelTargetKmh != targetKmh ||
-            hasReachedDecelerationTarget(targetKmh)
-        ) {
-            stopBrakeVoicePrompt()
-            return
+        totalDistanceM = snapshot.totalDistanceM
+        currentSpeedKmh = snapshot.currentSpeedKmh
+        insideTrackArea = snapshot.insideTrackArea
+        brakeLineLocation = snapshot.brakeLineLocation?.let { point ->
+            Location("tracking_service").apply {
+                latitude = point.latitude
+                longitude = point.longitude
+            }
         }
+        drivingActionState = snapshot.drivingActionState
+        odoConfirmedAtSessionDistanceM = snapshot.odoConfirmedAtSessionDistanceM
+        currentRoutePoints.clear()
+        currentRoutePoints.addAll(snapshot.currentRoutePoints)
+        referenceRoutePoints.clear()
+        referenceRoutePoints.addAll(snapshot.referenceRoutePoints)
+        hasReferenceRoute = snapshot.hasReferenceRoute
 
-        val engine = textToSpeech
-        if (!isTextToSpeechReady || engine == null) {
-            playFallbackAlarmTone()
-            showVoiceUnavailableMessageIfNeeded()
-            uiHandler.postDelayed(brakeVoiceRepeatRunnable, brakeVoiceRepeatDelayMs)
-            return
-        }
-
-        brakeVoiceUtteranceSequence += 1L
-        val utteranceId = "brake-guidance-$brakeVoiceUtteranceSequence"
-        currentBrakeVoiceUtteranceId = utteranceId
-        val result = engine.speak(
-            brakeVoiceMessage(targetKmh),
-            TextToSpeech.QUEUE_FLUSH,
-            null,
-            utteranceId
+        previewView?.setReferenceRoute(referenceRoutePoints)
+        previewView?.setCurrentRoute(currentRoutePoints)
+        previewView?.setBrakeLine(
+            brakeLineLocation?.latitude,
+            brakeLineLocation?.longitude
         )
-        if (result == TextToSpeech.ERROR) {
-            currentBrakeVoiceUtteranceId = null
-            playFallbackAlarmTone()
-            uiHandler.postDelayed(brakeVoiceRepeatRunnable, brakeVoiceRepeatDelayMs)
-        }
-    }
 
-    private fun onBrakeVoiceUtteranceFinished(utteranceId: String?, failed: Boolean) {
-        uiHandler.post {
-            if (!isBrakeVoiceActive || utteranceId != currentBrakeVoiceUtteranceId) return@post
-            currentBrakeVoiceUtteranceId = null
-            if (failed) playFallbackAlarmTone()
-            uiHandler.removeCallbacks(brakeVoiceRepeatRunnable)
-            uiHandler.postDelayed(brakeVoiceRepeatRunnable, brakeVoiceRepeatDelayMs)
-        }
-    }
-
-    private fun brakeVoiceMessage(targetKmh: Int): String {
-        return if (targetKmh <= 0) {
-            "완전히 정차하세요."
-        } else {
-            "시속 ${targetKmh}킬로미터까지 감속하세요."
-        }
-    }
-
-    private fun showVoiceUnavailableMessageIfNeeded() {
-        if (!isTextToSpeechInitializationFinished || hasShownVoiceUnavailableToast) return
-        hasShownVoiceUnavailableToast = true
-        Toast.makeText(this, "한국어 음성 안내를 사용할 수 없어 경고음으로 알립니다.", Toast.LENGTH_LONG).show()
-    }
-
-    private fun playFallbackAlarmTone() {
-        if (lapAlarmTone == null) {
-            lapAlarmTone = ToneGenerator(AudioManager.STREAM_ALARM, 100)
-        }
-        lapAlarmTone?.startTone(ToneGenerator.TONE_PROP_BEEP, 500)
-    }
-
-    private fun resumeBrakeAlertIfNeeded() {
         if (
-            currentScreen != Screen.Track ||
-            sessionState != SessionState.Running ||
-            drivingActionState != DrivingActionState.DECELERATING
-        ) return
+            snapshot.noticeSequence > lastTrackingNoticeSequence &&
+            !snapshot.noticeMessage.isNullOrBlank()
+        ) {
+            lastTrackingNoticeSequence = snapshot.noticeSequence
+            Toast.makeText(this, snapshot.noticeMessage, Toast.LENGTH_LONG).show()
+        }
 
-        val step = currentScenarioStep() ?: return
-        val targetKmh = step.decelTargetKmh ?: return
-        if (hasReachedDecelerationTarget(targetKmh)) return
-        startRedFlashLoop()
-        if (!isBrakeVoiceActive) startBrakeVoicePrompt(step)
+        if (currentScreen == Screen.Track) {
+            updateTrackUi()
+        }
+        syncRedFlashFromTrackingState()
+        updateControlButtons()
+        openRequestedTrackIfReady()
     }
 
-    private fun initLocationListener() {
-        if (locationListener != null) return
-        locationListener = object : LocationListener {
-            override fun onLocationChanged(location: Location) {
-                onLocationUpdated(location)
-            }
+    private fun openRequestedTrackIfReady() {
+        if (!openTrackWhenServiceConnect) return
+        val snapshot = latestTrackingSnapshot ?: return
+        val powertrain = snapshot.selectedPowertrain ?: return
+        if (!snapshot.isSessionActive && snapshot.sessionState != SessionState.Finished) return
 
-            @Deprecated("Deprecated in Android")
-            override fun onProviderDisabled(provider: String) {
-                // no-op
-            }
+        openTrackWhenServiceConnect = false
+        selectedPowertrain = powertrain
+        if (currentScreen != Screen.Track) showTrack()
+    }
 
-            @Deprecated("Deprecated in Android")
-            override fun onProviderEnabled(provider: String) {
-                // no-op
-            }
-
-            @Deprecated("Deprecated in Android")
-            override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {
-                // no-op
-            }
+    private fun syncRedFlashFromTrackingState() {
+        if (
+            currentScreen == Screen.Track &&
+            sessionState == SessionState.Running &&
+            drivingActionState == DrivingActionState.DECELERATING
+        ) {
+            startRedFlashLoop()
+        } else {
+            stopRedFlashLoop()
         }
     }
 
@@ -411,172 +323,50 @@ class MainActivity : Activity() {
     @Suppress("DEPRECATION")
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode != permissionRequestCode) return
-        val allowed = grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
-        val action = pendingPermissionAction
-        pendingPermissionAction = null
-        if (allowed) {
-            action?.invoke()
-            startLocationUpdates()
-        } else {
-            Toast.makeText(this, "위치 권한이 필요합니다.", Toast.LENGTH_SHORT).show()
+        when (requestCode) {
+            permissionRequestCode -> {
+                val action = pendingPermissionAction
+                pendingPermissionAction = null
+                if (hasLocationPermission()) {
+                    trackingService?.startPreviewTracking()
+                    action?.invoke()
+                } else {
+                    Toast.makeText(this, "위치 권한이 필요합니다.", Toast.LENGTH_SHORT).show()
+                }
+            }
+            notificationPermissionRequestCode -> {
+                val action = pendingNotificationPermissionAction
+                pendingNotificationPermissionAction = null
+                if (
+                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                    checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) !=
+                    PackageManager.PERMISSION_GRANTED
+                ) {
+                    Toast.makeText(
+                        this,
+                        "알림 권한이 없어 주행 상태 알림이 알림창에 표시되지 않을 수 있습니다.",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+                action?.invoke()
+            }
         }
     }
 
-    private fun startLocationUpdates() {
-        if (isLocationListening || !hasLocationPermission()) return
-        val listener = locationListener ?: return
-        val provider = when {
-            locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER) -> LocationManager.GPS_PROVIDER
-            locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER) -> LocationManager.NETWORK_PROVIDER
-            else -> ""
-        }
-        if (provider.isEmpty()) {
-            Toast.makeText(this, "GPS 또는 네트워크 위치가 꺼져 있습니다.", Toast.LENGTH_SHORT).show()
+    private fun requestNotificationPermission(action: () -> Unit) {
+        if (
+            Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) ==
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            action()
             return
         }
-
-        locationManager.requestLocationUpdates(
-            provider,
-            locationUpdateIntervalMs,
-            locationUpdateMinDistanceM,
-            listener,
-            mainLooper
+        pendingNotificationPermissionAction = action
+        requestPermissions(
+            arrayOf(Manifest.permission.POST_NOTIFICATIONS),
+            notificationPermissionRequestCode
         )
-        isLocationListening = true
-        locationManager.getLastKnownLocation(provider)?.let { onLocationUpdated(it) }
-    }
-
-    private fun stopLocationUpdates() {
-        if (!isLocationListening) return
-        locationListener?.let { locationManager.removeUpdates(it) }
-        isLocationListening = false
-    }
-
-    private fun onLocationUpdated(location: Location) {
-        val prev = currentLocation
-        val nowMs = SystemClock.elapsedRealtime()
-
-        if (prev != null) {
-            val dtMs = max(1L, nowMs - previousLocationUpdateMs)
-            val deltaM = prev.distanceTo(location).coerceAtLeast(0f).toDouble()
-            val dtSec = dtMs / 1000.0
-            val speedSample = calculateSpeedSample(prev, location, dtSec, deltaM)
-            latestRawSpeedKmh = speedSample.speedKmh.takeIf { speedSample.isValidForControl }
-            currentSpeedKmh = smoothSpeedKmh(speedSample.speedKmh)
-            val acceptedDeltaM = if (shouldAcceptMovement(location, deltaM, currentSpeedKmh)) deltaM else 0.0
-
-            val isTrackingOdo =
-                sessionState == SessionState.Running || sessionState == SessionState.Paused
-            if (isTrackingOdo && acceptedDeltaM > 0.0) {
-                totalDistanceM += acceptedDeltaM
-            }
-            if (sessionState == SessionState.Running && acceptedDeltaM > 0.0) {
-                appendCurrentRoutePoint(location)
-                updateTrackAreaState(location)
-                previewView?.setState(
-                    isInTrack = insideTrackArea,
-                    isRunning = true,
-                    latitude = location.latitude,
-                    longitude = location.longitude
-                )
-                syncScenarioState()
-                evaluateLap(location)
-                updateDrivingActionState()
-            }
-            if (sessionState == SessionState.Paused) {
-                updatePausedBrakeLineState(location)
-            }
-            previousLocationUpdateMs = nowMs
-        } else {
-            previousLocationUpdateMs = nowMs
-            val speedSample = calculateSpeedSample(null, location, 0.0, 0.0)
-            latestRawSpeedKmh = speedSample.speedKmh.takeIf { speedSample.isValidForControl }
-            currentSpeedKmh = smoothSpeedKmh(speedSample.speedKmh)
-        }
-
-        previousLocation = prev ?: location
-        currentLocation = location
-        if (brakeLineLocation != null && sessionState != SessionState.Idle) {
-            updateTrackAreaState(location)
-        }
-        if (sessionState != SessionState.Running) {
-            stopRedFlashLoop()
-        }
-        updateTrackUi()
-    }
-
-    private fun calculateSpeedSample(
-        prev: Location?,
-        location: Location,
-        dtSec: Double,
-        deltaM: Double
-    ): SpeedSample {
-        if (!isUsableLocation(location)) return SpeedSample(0.0, isValidForControl = false)
-
-        val hasTrustedGpsSpeed = isTrustedGpsSpeed(location)
-        val gpsSpeedKmh = if (hasTrustedGpsSpeed) {
-            location.speed.toDouble() * 3.6
-        } else {
-            null
-        }
-        val distanceSpeedKmh = if (
-            prev != null &&
-            isUsableLocation(prev) &&
-            dtSec >= minSpeedSampleSeconds &&
-            deltaM >= stationaryDistanceM
-        ) {
-            deltaM / dtSec * 3.6
-        } else {
-            null
-        }
-
-        val rawSpeedKmh = gpsSpeedKmh ?: distanceSpeedKmh ?: 0.0
-        val hasStationaryEvidence =
-            prev != null &&
-                isUsableLocation(prev) &&
-                dtSec >= minSpeedSampleSeconds &&
-                deltaM < stationaryDistanceM
-        val normalizedSpeedKmh = if (
-            !hasTrustedGpsSpeed &&
-            prev != null &&
-            deltaM < stationaryDistanceM &&
-            rawSpeedKmh < lowSpeedGpsJitterKmh
-        ) {
-            0.0
-        } else if (rawSpeedKmh < minimumMovingSpeedKmh) {
-            0.0
-        } else {
-            rawSpeedKmh
-        }
-        return SpeedSample(
-            speedKmh = normalizedSpeedKmh,
-            isValidForControl = gpsSpeedKmh != null || distanceSpeedKmh != null || hasStationaryEvidence
-        )
-    }
-
-    private fun smoothSpeedKmh(rawSpeedKmh: Double): Double {
-        if (rawSpeedKmh <= 0.0) return 0.0
-        if (currentSpeedKmh <= 0.0) return rawSpeedKmh
-        return currentSpeedKmh * (1.0 - speedSmoothingAlpha) + rawSpeedKmh * speedSmoothingAlpha
-    }
-
-    private fun shouldAcceptMovement(location: Location, deltaM: Double, speedKmh: Double): Boolean {
-        val trustedGpsMovement = isTrustedGpsSpeed(location) && deltaM >= 0.5
-        return isUsableLocation(location) &&
-            speedKmh >= minimumMovingSpeedKmh &&
-            (deltaM >= stationaryDistanceM || trustedGpsMovement)
-    }
-
-    private fun isUsableLocation(location: Location): Boolean {
-        return !location.hasAccuracy() || location.accuracy <= maxLocationAccuracyM
-    }
-
-    private fun isTrustedGpsSpeed(location: Location): Boolean {
-        if (location.provider != LocationManager.GPS_PROVIDER) return false
-        if (!location.hasSpeed()) return false
-        if (!isUsableLocation(location)) return false
-        return !location.hasSpeedAccuracy() || location.speedAccuracyMetersPerSecond <= maxSpeedAccuracyMps
     }
 
     private fun startRedFlashLoop() {
@@ -593,7 +383,6 @@ class MainActivity : Activity() {
         redFlashOverlay?.animate()?.cancel()
         redFlashOverlay?.alpha = 0f
         redFlashOverlay?.visibility = View.GONE
-        stopBrakeVoicePrompt()
     }
 
     private fun runRedFlashPulse() {
@@ -621,232 +410,6 @@ class MainActivity : Activity() {
             .start()
     }
 
-    private fun evaluateLap(location: Location) {
-        val inGate = isInBrakeLineGate(location)
-        val traveledFromLastGate = totalDistanceM - lastGateDistanceM
-        if (!wasInBrakeLineGate && inGate && traveledFromLastGate >= gpsGateMinDistanceM) {
-            lastGateDistanceM = totalDistanceM
-            wasInBrakeLineGate = true
-            saveReferenceRouteIfReady()
-            startNewLapRoute(location)
-
-            val step = currentScenarioStep()
-            if (step?.driveMode == ScenarioDriveMode.ACCEL_DECEL) {
-                drivingActionState = DrivingActionState.DECELERATING
-                triggerLapAlarm(step)
-            } else {
-                drivingActionState = DrivingActionState.CRUISING
-            }
-        } else if (wasInBrakeLineGate && !inGate) {
-            wasInBrakeLineGate = false
-        }
-    }
-
-    private fun updatePausedBrakeLineState(location: Location) {
-        val inGate = isInBrakeLineGate(location)
-        if (!wasInBrakeLineGate && inGate) {
-            lastGateDistanceM = totalDistanceM
-        }
-        wasInBrakeLineGate = inGate
-    }
-
-    private fun triggerLapAlarm(step: DrivingScenarioStep) {
-        startRedFlashLoop()
-        startBrakeVoicePrompt(step)
-    }
-
-    private fun isInBrakeLineGate(location: Location): Boolean {
-        val center = brakeLineLocation ?: return false
-        val frame = brakeLineFrame()
-            ?: return location.distanceTo(center) <= brakeLineFallbackRadiusM
-
-        val eastM = longitudeDeltaMeters(location.longitude - center.longitude, center.latitude)
-        val northM = latitudeDeltaMeters(location.latitude - center.latitude)
-        val alongTrackM = eastM * frame.tangentEast + northM * frame.tangentNorth
-        val acrossTrackM = -eastM * frame.tangentNorth + northM * frame.tangentEast
-        return abs(alongTrackM) <= brakeLineDetectionHalfWidthM &&
-            abs(acrossTrackM) <= brakeLineHalfLengthM
-    }
-
-    private fun brakeLineFrame(): BrakeLineFrame? {
-        val center = brakeLineLocation ?: return null
-        val useClosedReference = hasReferenceRoute && referenceRoutePoints.size >= 4
-        val route = if (useClosedReference) referenceRoutePoints else currentRoutePoints
-        if (route.size < 2) return null
-
-        var nearestIndex = 0
-        var nearestDistanceM = Double.POSITIVE_INFINITY
-        route.forEachIndexed { index, point ->
-            val distanceM = distanceMeters(center.latitude, center.longitude, point.latitude, point.longitude)
-            if (distanceM < nearestDistanceM) {
-                nearestDistanceM = distanceM
-                nearestIndex = index
-            }
-        }
-
-        val sampleOffset = min(4, max(1, route.size / 8))
-        val beforeIndex: Int
-        val afterIndex: Int
-        if (useClosedReference) {
-            beforeIndex = (nearestIndex - sampleOffset + route.size) % route.size
-            afterIndex = (nearestIndex + sampleOffset) % route.size
-        } else {
-            beforeIndex = max(0, nearestIndex - sampleOffset)
-            afterIndex = min(route.lastIndex, nearestIndex + sampleOffset)
-        }
-        if (beforeIndex == afterIndex) return null
-
-        val before = route[beforeIndex]
-        val after = route[afterIndex]
-        val eastM = longitudeDeltaMeters(after.longitude - before.longitude, center.latitude)
-        val northM = latitudeDeltaMeters(after.latitude - before.latitude)
-        val lengthM = sqrt(eastM * eastM + northM * northM)
-        if (lengthM < 1.0) return null
-        return BrakeLineFrame(eastM / lengthM, northM / lengthM)
-    }
-
-    private fun updateTrackAreaState(location: Location) {
-        if (!hasReferenceRoute || referenceRoutePoints.size < 2) {
-            insideTrackArea = true
-            return
-        }
-
-        val dist = distanceToReferenceRouteM(location.latitude, location.longitude)
-        insideTrackArea = dist <= referenceRouteToleranceM
-    }
-
-    private fun appendCurrentRoutePoint(location: Location, force: Boolean = false) {
-        val point = GeoPoint(location.latitude, location.longitude)
-        val last = currentRoutePoints.lastOrNull()
-        val shouldAppend = force ||
-            last == null ||
-            distanceMeters(last.latitude, last.longitude, point.latitude, point.longitude) >= routePointMinSpacingM
-        if (!shouldAppend) return
-
-        currentRoutePoints.add(point)
-        if (currentRoutePoints.size > maxCurrentRoutePoints) {
-            currentRoutePoints.removeAt(0)
-        }
-    }
-
-    private fun saveReferenceRouteIfReady() {
-        if (hasReferenceRoute) return
-        if (currentRoutePoints.size < referenceRouteMinPoints) return
-        if (totalDistanceM < referenceRouteMinDistanceM) return
-
-        referenceRoutePoints.clear()
-        referenceRoutePoints.addAll(smoothRoute(currentRoutePoints))
-        hasReferenceRoute = true
-        saveReferenceRoute()
-        previewView?.setReferenceRoute(referenceRoutePoints)
-        Toast.makeText(this, "기준 주행 경로가 저장되었습니다.", Toast.LENGTH_SHORT).show()
-    }
-
-    private fun smoothRoute(points: List<GeoPoint>): List<GeoPoint> {
-        if (points.size < 5) return points.toList()
-        val radius = 2
-        return points.indices.map { index ->
-            val from = max(0, index - radius)
-            val to = min(points.lastIndex, index + radius)
-            var latitudeSum = 0.0
-            var longitudeSum = 0.0
-            for (sampleIndex in from..to) {
-                latitudeSum += points[sampleIndex].latitude
-                longitudeSum += points[sampleIndex].longitude
-            }
-            val sampleCount = (to - from + 1).toDouble()
-            GeoPoint(latitudeSum / sampleCount, longitudeSum / sampleCount)
-        }
-    }
-
-    private fun startNewLapRoute(location: Location) {
-        currentRoutePoints.clear()
-        appendCurrentRoutePoint(location, force = true)
-        previewView?.beginLap(location.latitude, location.longitude)
-    }
-
-    private fun loadReferenceRoute() {
-        val encoded = getPreferences(MODE_PRIVATE).getString(referenceRoutePrefsKey, null) ?: return
-        referenceRoutePoints.clear()
-        encoded.split(";").forEach { token ->
-            val parts = token.split(",")
-            if (parts.size == 2) {
-                val lat = parts[0].toDoubleOrNull()
-                val lon = parts[1].toDoubleOrNull()
-                if (lat != null && lon != null) referenceRoutePoints.add(GeoPoint(lat, lon))
-            }
-        }
-        hasReferenceRoute = referenceRoutePoints.size >= referenceRouteMinPoints
-    }
-
-    private fun loadBrakeLine() {
-        val prefs = getPreferences(MODE_PRIVATE)
-        val latitude = prefs.getString(brakeLineLatitudePrefsKey, null)?.toDoubleOrNull() ?: return
-        val longitude = prefs.getString(brakeLineLongitudePrefsKey, null)?.toDoubleOrNull() ?: return
-        brakeLineLocation = Location("saved_brake_line").apply {
-            this.latitude = latitude
-            this.longitude = longitude
-        }
-    }
-
-    private fun saveBrakeLine() {
-        val line = brakeLineLocation ?: return
-        getPreferences(MODE_PRIVATE).edit()
-            .putString(brakeLineLatitudePrefsKey, line.latitude.toString())
-            .putString(brakeLineLongitudePrefsKey, line.longitude.toString())
-            .apply()
-    }
-
-    private fun saveReferenceRoute() {
-        val encoded = referenceRoutePoints.joinToString(";") { "${it.latitude},${it.longitude}" }
-        getPreferences(MODE_PRIVATE).edit().putString(referenceRoutePrefsKey, encoded).apply()
-    }
-
-    private fun clearReferenceRoute() {
-        referenceRoutePoints.clear()
-        hasReferenceRoute = false
-        getPreferences(MODE_PRIVATE).edit().remove(referenceRoutePrefsKey).apply()
-    }
-
-    private fun distanceToReferenceRouteM(latitude: Double, longitude: Double): Double {
-        var best = Double.POSITIVE_INFINITY
-        for (index in 0 until referenceRoutePoints.size - 1) {
-            best = min(best, distanceToSegmentM(latitude, longitude, referenceRoutePoints[index], referenceRoutePoints[index + 1]))
-        }
-        if (referenceRoutePoints.size > 2) {
-            best = min(best, distanceToSegmentM(latitude, longitude, referenceRoutePoints.last(), referenceRoutePoints.first()))
-        }
-        return best
-    }
-
-    private fun distanceToSegmentM(latitude: Double, longitude: Double, start: GeoPoint, end: GeoPoint): Double {
-        val ax = longitudeDeltaMeters(start.longitude - longitude, latitude)
-        val ay = latitudeDeltaMeters(start.latitude - latitude)
-        val bx = longitudeDeltaMeters(end.longitude - longitude, latitude)
-        val by = latitudeDeltaMeters(end.latitude - latitude)
-        val vx = bx - ax
-        val vy = by - ay
-        val lengthSquared = vx * vx + vy * vy
-        if (lengthSquared <= 0.001) return sqrt(ax * ax + ay * ay)
-
-        val t = (-(ax * vx + ay * vy) / lengthSquared).coerceIn(0.0, 1.0)
-        val px = ax + t * vx
-        val py = ay + t * vy
-        return sqrt(px * px + py * py)
-    }
-
-    private fun latitudeDeltaMeters(deltaLatitude: Double): Double = deltaLatitude * 110_540.0
-
-    private fun longitudeDeltaMeters(deltaLongitude: Double, baseLatitude: Double): Double {
-        return deltaLongitude * 111_320.0 * cos(Math.toRadians(baseLatitude))
-    }
-
-    private fun distanceMeters(lat1: Double, lon1: Double, lat2: Double, lon2: Double): Double {
-        val out = FloatArray(1)
-        Location.distanceBetween(lat1, lon1, lat2, lon2, out)
-        return out[0].toDouble()
-    }
-
     private fun testProgressDistanceKm(): Double {
         val gpsDistanceSinceOdoConfirmationKm =
             max(0.0, totalDistanceM - odoConfirmedAtSessionDistanceM) / 1000.0
@@ -857,53 +420,6 @@ class MainActivity : Activity() {
     private fun currentScenarioStep(): DrivingScenarioStep? {
         val powertrain = selectedPowertrain ?: return null
         return KatriDrivingScenario.stepAt(testProgressDistanceKm(), powertrain)
-    }
-
-    private fun syncScenarioState() {
-        val step = currentScenarioStep()
-        if (step?.id == activeScenarioStepId) return
-
-        activeScenarioStepId = step?.id
-        drivingActionState = when (step?.driveMode) {
-            ScenarioDriveMode.ACCEL_DECEL -> DrivingActionState.WAITING_FOR_BRAKE_LINE
-            else -> DrivingActionState.CRUISING
-        }
-        stopRedFlashLoop()
-    }
-
-    private fun hasReachedDecelerationTarget(targetKmh: Int): Boolean {
-        return DrivingSpeedRules.hasReachedDecelerationTarget(
-            targetKmh = targetKmh,
-            displayedSpeedKmh = currentSpeedKmh,
-            latestRawSpeedKmh = latestRawSpeedKmh,
-            toleranceKmh = speedTargetToleranceKmh
-        )
-    }
-
-    private fun updateDrivingActionState() {
-        if (sessionState != SessionState.Running) return
-        val step = currentScenarioStep() ?: return
-        if (step.driveMode != ScenarioDriveMode.ACCEL_DECEL) {
-            drivingActionState = DrivingActionState.CRUISING
-            stopRedFlashLoop()
-            return
-        }
-
-        when (drivingActionState) {
-            DrivingActionState.DECELERATING -> {
-                val target = step.decelTargetKmh ?: return
-                if (hasReachedDecelerationTarget(target)) {
-                    drivingActionState = DrivingActionState.ACCELERATING
-                    stopRedFlashLoop()
-                }
-            }
-            DrivingActionState.ACCELERATING -> {
-                if (currentSpeedKmh >= step.targetSpeedKmh - speedTargetToleranceKmh) {
-                    drivingActionState = DrivingActionState.WAITING_FOR_BRAKE_LINE
-                }
-            }
-            else -> Unit
-        }
     }
 
     private fun scenarioInstruction(step: DrivingScenarioStep?): String {
@@ -957,8 +473,13 @@ class MainActivity : Activity() {
         }
         currentScreen = Screen.Track
         setContentView(createTrackView())
-        if (hasLocationPermission()) startLocationUpdates() else requestLocationPermission { startLocationUpdates() }
+        if (hasLocationPermission()) {
+            trackingService?.startPreviewTracking()
+        } else {
+            requestLocationPermission { trackingService?.startPreviewTracking() }
+        }
         updateTrackUi()
+        syncRedFlashFromTrackingState()
     }
 
     private fun createHomeView(): FrameLayout {
@@ -1001,7 +522,15 @@ class MainActivity : Activity() {
         content.addView(subtitle, fullWidth())
         content.addView(space(dp(42)))
         content.addView(
-            primaryButton("고주로 주행") { showPowertrainSelection() },
+            primaryButton("고주로 주행") {
+                val activeSnapshot = latestTrackingSnapshot
+                if (activeSnapshot?.isSessionActive == true && activeSnapshot.selectedPowertrain != null) {
+                    selectedPowertrain = activeSnapshot.selectedPowertrain
+                    showTrack()
+                } else {
+                    showPowertrainSelection()
+                }
+            },
             largeButton()
         )
         root.addView(content, matchParent())
@@ -1062,9 +591,20 @@ class MainActivity : Activity() {
     }
 
     private fun selectPowertrainAndShowTrack(powertrainType: PowertrainType) {
+        val activeSnapshot = latestTrackingSnapshot
+        if (activeSnapshot?.isSessionActive == true) {
+            selectedPowertrain = activeSnapshot.selectedPowertrain
+            Toast.makeText(this, "진행 중인 주행 시험을 다시 엽니다.", Toast.LENGTH_SHORT).show()
+            showTrack()
+            return
+        }
         selectedPowertrain = powertrainType
-        activeScenarioStepId = null
         drivingActionState = DrivingActionState.CRUISING
+        trackingService?.configureSession(
+            powertrainType,
+            selectedStartOdo,
+            selectedTrackOdo
+        )
         showTrack()
     }
 
@@ -1223,21 +763,22 @@ class MainActivity : Activity() {
             }
 
             val enteredText = trackOdoInput.text.toString().trim()
-            val enteredOdo = enteredText.toDoubleOrNull()
-            if (enteredOdo == null || enteredOdo < 0.0) {
-                Toast.makeText(this@MainActivity, "올바른 ODO 값을 입력하세요.", Toast.LENGTH_SHORT).show()
+            val service = trackingService
+            if (service == null) {
+                Toast.makeText(this@MainActivity, "주행 서비스에 연결 중입니다.", Toast.LENGTH_SHORT).show()
                 return@setOnClickListener
             }
-            val startOdo = selectedStartOdo.toDoubleOrNull()
-            if (startOdo != null && enteredOdo < startOdo) {
-                Toast.makeText(this@MainActivity, "현재 ODO는 시작 ODO보다 작을 수 없습니다.", Toast.LENGTH_SHORT).show()
+            val result = service.confirmOdo(enteredText, selectedStartOdo)
+            if (!result.success) {
+                Toast.makeText(
+                    this@MainActivity,
+                    result.message ?: "ODO를 저장할 수 없습니다.",
+                    Toast.LENGTH_SHORT
+                ).show()
                 return@setOnClickListener
             }
 
             selectedTrackOdo = enteredText
-            odoConfirmedAtSessionDistanceM = totalDistanceM
-            activeScenarioStepId = null
-            syncScenarioState()
             trackOdoSavedText.text = currentOdoLabel()
             isTrackOdoEditing = false
             trackOdoInput.clearFocus()
@@ -1245,7 +786,11 @@ class MainActivity : Activity() {
                 .hideSoftInputFromWindow(trackOdoInput.windowToken, 0)
             updateTrackOdoMode()
             updateTrackUi()
-            Toast.makeText(this@MainActivity, "ODO가 저장되었습니다.", Toast.LENGTH_SHORT).show()
+            Toast.makeText(
+                this@MainActivity,
+                result.message ?: "ODO가 저장되었습니다.",
+                Toast.LENGTH_SHORT
+            ).show()
         }
         val trackOdoRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -1258,12 +803,21 @@ class MainActivity : Activity() {
         content.addView(trackOdoRow)
         content.addView(space(dp(10)))
 
-        btnSetBrakeLine = secondaryButton("브레이크 시작선 수동 설정") {
+        btnSetBrakeLine = secondaryButton("시작선 수동 설정") {
             setBrakeLine()
         }.apply {
             textSize = 13f
             minWidth = 0
             minimumWidth = 0
+            setPadding(dp(12), 0, dp(12), 0)
+        }
+        btnClearBrakeLine = secondaryButton("시작선 초기화") {
+            confirmClearBrakeLine()
+        }.apply {
+            textSize = 13f
+            minWidth = 0
+            minimumWidth = 0
+            setTextColor(Color.rgb(185, 28, 28))
             setPadding(dp(12), 0, dp(12), 0)
         }
         btnStartPause = primaryButton("주행 시작") {
@@ -1292,10 +846,17 @@ class MainActivity : Activity() {
         content.addView(
             LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.END
                 addView(
                     btnSetBrakeLine,
-                    LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(44))
+                    LinearLayout.LayoutParams(0, dp(44), 1f).apply {
+                        rightMargin = dp(4)
+                    }
+                )
+                addView(
+                    btnClearBrakeLine,
+                    LinearLayout.LayoutParams(0, dp(44), 1f).apply {
+                        leftMargin = dp(4)
+                    }
                 )
             },
             fullWidth()
@@ -1390,158 +951,109 @@ class MainActivity : Activity() {
     private fun startSession() {
         if (!hasLocationPermission()) {
             requestLocationPermission {
-                startLocationUpdates()
                 startSession()
             }
             return
         }
-
-        var brakeLineWasSetAutomatically = false
-        if (brakeLineLocation == null) {
-            val now = currentLocation
-            if (now == null) {
-                Toast.makeText(this, "GPS 위치를 수신 중입니다. 잠시 후 다시 시작하세요.", Toast.LENGTH_SHORT).show()
-                return
-            }
-            val locationIssue = brakeLineLocationIssue(now)
-            if (locationIssue != null) {
-                Toast.makeText(this, locationIssue, Toast.LENGTH_SHORT).show()
-                return
-            }
-            applyBrakeLine(now)
-            brakeLineWasSetAutomatically = true
+        val powertrain = selectedPowertrain ?: return
+        val service = trackingService
+        if (service == null) {
+            Toast.makeText(this, "주행 서비스에 연결 중입니다.", Toast.LENGTH_SHORT).show()
+            return
         }
-        if (sessionState == SessionState.Idle || sessionState == SessionState.Ready || sessionState == SessionState.Finished) {
-            stopRedFlashLoop()
-            totalDistanceM = 0.0
-            lastGateDistanceM = 0.0
-            currentSpeedKmh = 0.0
-            latestRawSpeedKmh = null
-            odoConfirmedAtSessionDistanceM = 0.0
-            activeScenarioStepId = null
-            drivingActionState = DrivingActionState.CRUISING
-            previewView?.clearPath()
-            currentRoutePoints.clear()
-            currentLocation?.let { appendCurrentRoutePoint(it, force = true) }
-            wasInBrakeLineGate = true
-            previousLocation = currentLocation
-            previousLocationUpdateMs = SystemClock.elapsedRealtime()
+        val readinessIssue = service.startReadinessIssue()
+        if (readinessIssue != null) {
+            Toast.makeText(this, readinessIssue, Toast.LENGTH_SHORT).show()
+            return
         }
 
-        wasInBrakeLineGate = isInBrakeLineGate(currentLocation ?: brakeLineLocation!!)
-        sessionState = SessionState.Running
-        syncScenarioState()
-        updateControlButtons()
-        updateTrackUi()
+        val brakeLineWasSetAutomatically = service.snapshot().brakeLineLocation == null
         if (brakeLineWasSetAutomatically) {
-            Toast.makeText(this, "현재 위치를 브레이크 시작선으로 설정하고 주행을 시작했습니다.", Toast.LENGTH_SHORT).show()
+            val result = service.setBrakeLineAtCurrentLocation()
+            if (!result.success) {
+                Toast.makeText(
+                    this,
+                    result.message ?: "브레이크 시작선을 설정할 수 없습니다.",
+                    Toast.LENGTH_SHORT
+                ).show()
+                return
+            }
+        }
+
+        requestNotificationPermission {
+            DrivingTrackingService.startSession(
+                this,
+                powertrain,
+                selectedStartOdo,
+                selectedTrackOdo
+            )
+            if (brakeLineWasSetAutomatically) {
+                Toast.makeText(
+                    this,
+                    "현재 위치를 브레이크 시작선으로 설정하고 주행을 시작했습니다.",
+                    Toast.LENGTH_SHORT
+                ).show()
+            }
         }
     }
 
     private fun pauseSession() {
-        if (sessionState != SessionState.Running) return
-        sessionState = SessionState.Paused
-        currentSpeedKmh = 0.0
-        stopRedFlashLoop()
-        updateControlButtons()
-        tvStatus?.text = currentStatusLabel()
-        updateTrackUi()
+        trackingService?.pauseSession()
     }
 
     private fun resumeSession() {
-        if (sessionState != SessionState.Paused) return
-        sessionState = SessionState.Running
-        updateControlButtons()
-        tvStatus?.text = currentStatusLabel()
-        updateTrackUi()
-        resumeBrakeAlertIfNeeded()
+        trackingService?.resumeSession()
     }
 
     private fun stopSession() {
-        if (sessionState == SessionState.Idle || sessionState == SessionState.Ready) return
-        sessionState = SessionState.Finished
-        currentSpeedKmh = 0.0
-        latestRawSpeedKmh = null
-        stopRedFlashLoop()
-        tvStatus?.text = currentStatusLabel()
-        updateControlButtons()
-        updateTrackUi()
+        trackingService?.stopSession()
         Toast.makeText(this, "주행 시험이 종료되었습니다.", Toast.LENGTH_SHORT).show()
     }
 
     private fun resetToReady() {
-        totalDistanceM = 0.0
-        lastGateDistanceM = 0.0
-        wasInBrakeLineGate = false
-        currentSpeedKmh = 0.0
-        latestRawSpeedKmh = null
-        odoConfirmedAtSessionDistanceM = 0.0
-        activeScenarioStepId = null
-        drivingActionState = DrivingActionState.CRUISING
-        stopRedFlashLoop()
-        currentRoutePoints.clear()
-        sessionState = SessionState.Ready
-        updateControlButtons()
-        updateTrackUi()
-        previewView?.clearPath()
+        trackingService?.resetToReady()
     }
 
     private fun setBrakeLine() {
         requestLocationPermission {
-            val now = currentLocation
-            if (now == null) {
-                Toast.makeText(this, "현재 위치를 사용할 수 없습니다.", Toast.LENGTH_SHORT).show()
+            val service = trackingService
+            if (service == null) {
+                Toast.makeText(this, "주행 서비스에 연결 중입니다.", Toast.LENGTH_SHORT).show()
                 return@requestLocationPermission
             }
-            val locationIssue = brakeLineLocationIssue(now)
-            if (locationIssue != null) {
-                Toast.makeText(this, locationIssue, Toast.LENGTH_SHORT).show()
-                return@requestLocationPermission
-            }
-            applyBrakeLine(now)
-            Toast.makeText(this, "브레이크 시작선이 설정되었습니다.", Toast.LENGTH_SHORT).show()
+            val result = service.setBrakeLineAtCurrentLocation()
+            Toast.makeText(
+                this,
+                result.message ?: if (result.success) {
+                    "브레이크 시작선이 설정되었습니다."
+                } else {
+                    "브레이크 시작선을 설정할 수 없습니다."
+                },
+                Toast.LENGTH_SHORT
+            ).show()
         }
     }
 
-    private fun applyBrakeLine(location: Location) {
-        brakeLineLocation = Location(location)
-        saveBrakeLine()
-        sessionState = SessionState.Ready
-        totalDistanceM = 0.0
-        lastGateDistanceM = 0.0
-        wasInBrakeLineGate = true
-        currentSpeedKmh = 0.0
-        latestRawSpeedKmh = null
-        odoConfirmedAtSessionDistanceM = 0.0
-        activeScenarioStepId = null
-        drivingActionState = DrivingActionState.CRUISING
-        stopRedFlashLoop()
-        currentRoutePoints.clear()
-        previewView?.clearPath()
-        previewView?.setBrakeLine(location.latitude, location.longitude)
-        previewView?.setState(isInTrack = true, isRunning = false)
-        tvBrakeLine?.text = "브레이크 시작선: 설정됨"
-        updateControlButtons()
-        updateTrackUi()
-    }
-
-    private fun brakeLineLocationIssue(location: Location): String? {
-        if (location.provider != LocationManager.GPS_PROVIDER) {
-            return "브레이크 시작선 설정을 위해 GPS 신호가 필요합니다."
-        }
-        if (!location.hasAccuracy() || location.accuracy > maxLocationAccuracyM) {
-            return "GPS 정확도가 낮습니다. 신호가 안정된 후 다시 시작하세요."
-        }
-        val locationAgeMs = if (location.elapsedRealtimeNanos > 0L) {
-            (SystemClock.elapsedRealtimeNanos() - location.elapsedRealtimeNanos)
-                .coerceAtLeast(0L) / 1_000_000L
-        } else {
-            0L
-        }
-        if (locationAgeMs > staleSpeedTimeoutMs) {
-            return "최신 GPS 위치를 기다리는 중입니다. 잠시 후 다시 시작하세요."
-        }
-        return null
+    private fun confirmClearBrakeLine() {
+        if (brakeLineLocation == null) return
+        AlertDialog.Builder(this)
+            .setTitle("브레이크 시작선 초기화")
+            .setMessage("저장된 브레이크 시작선을 삭제합니다. 다음 주행 시작 시 현재 위치가 새 시작선으로 설정됩니다.")
+            .setNegativeButton("취소", null)
+            .setPositiveButton("초기화") { _, _ ->
+                val result = trackingService?.clearBrakeLine()
+                    ?: TrackingCommandResult(false, "주행 서비스에 연결 중입니다.")
+                Toast.makeText(
+                    this,
+                    result.message ?: if (result.success) {
+                        "브레이크 시작선이 초기화되었습니다."
+                    } else {
+                        "브레이크 시작선을 초기화할 수 없습니다."
+                    },
+                    Toast.LENGTH_SHORT
+                ).show()
+            }
+            .show()
     }
 
     private fun updateControlButtons() {
@@ -1551,38 +1063,37 @@ class MainActivity : Activity() {
             SessionState.Paused -> "재개"
         }
         btnStartPause?.text = startLabel
+        btnStartPause?.isEnabled = trackingService != null
         btnStop?.text = if (sessionState == SessionState.Finished) "초기화" else "정지"
+        btnStop?.isEnabled = trackingService != null &&
+            sessionState != SessionState.Idle &&
+            sessionState != SessionState.Ready
         btnSetBrakeLine?.isEnabled =
+            trackingService != null
+        btnClearBrakeLine?.isEnabled =
+            trackingService != null &&
+            brakeLineLocation != null &&
             sessionState != SessionState.Running && sessionState != SessionState.Paused
         btnSetBrakeLine?.text = if (brakeLineLocation == null) {
-            "브레이크 시작선 수동 설정"
+            "시작선 수동 설정"
         } else {
-            "브레이크 시작선 재설정"
+            "시작선 재설정"
         }
     }
 
     private fun updateTrackUi() {
-        if (
-            (sessionState == SessionState.Running || sessionState == SessionState.Paused) &&
-            previousLocationUpdateMs > 0L &&
-            SystemClock.elapsedRealtime() - previousLocationUpdateMs > staleSpeedTimeoutMs
-        ) {
-            currentSpeedKmh = 0.0
-        }
         if (sessionState != SessionState.Running) {
             stopRedFlashLoop()
         }
 
         val location = currentLocation
-        val progressDistanceKm = testProgressDistanceKm()
+        val progressDistanceKm =
+            latestTrackingSnapshot?.testProgressDistanceKm ?: testProgressDistanceKm()
         val targetDistanceKm = selectedPowertrain
             ?.let(KatriDrivingScenario::targetDistanceKm)
             ?: KatriDrivingScenario.testTargetKm
-        if (sessionState != SessionState.Paused) {
-            syncScenarioState()
-            updateDrivingActionState()
-        }
-        val scenarioStep = currentScenarioStep()
+        val scenarioStep =
+            latestTrackingSnapshot?.scenarioStep ?: currentScenarioStep()
 
         tvSpeed?.text = String.format(Locale.US, "%.1f km/h", currentSpeedKmh)
         tvDistance?.text = String.format(Locale.US, "%.2f km", progressDistanceKm)
@@ -1957,6 +1468,12 @@ private class TrackPreviewView(context: android.content.Context) : View(context)
     fun setReferenceRoute(points: List<GeoPoint>) {
         referenceRoute.clear()
         referenceRoute.addAll(points)
+        invalidate()
+    }
+
+    fun setCurrentRoute(points: List<GeoPoint>) {
+        currentRoute.clear()
+        currentRoute.addAll(points.takeLast(maxRouteSize))
         invalidate()
     }
 
