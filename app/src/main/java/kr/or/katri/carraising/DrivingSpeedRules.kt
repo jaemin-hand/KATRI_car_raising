@@ -5,9 +5,14 @@ internal object DrivingSpeedRules {
         targetKmh: Int,
         displayedSpeedKmh: Double,
         latestRawSpeedKmh: Double?,
-        toleranceKmh: Double
+        toleranceKmh: Double,
+        hasStationaryEvidence: Boolean
     ): Boolean {
-        if (targetKmh <= 0) return displayedSpeedKmh <= 0.0
+        if (targetKmh <= 0) {
+            if (displayedSpeedKmh <= 0.0) return true
+            val decisionSpeedKmh = latestRawSpeedKmh ?: return false
+            return hasStationaryEvidence && decisionSpeedKmh <= toleranceKmh
+        }
         val decisionSpeedKmh = latestRawSpeedKmh ?: return false
         return decisionSpeedKmh <= targetKmh + toleranceKmh
     }

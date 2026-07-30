@@ -63,6 +63,7 @@ class DrivingTrackingService : Service() {
     private var wasInBrakeLineGate = false
     private var currentSpeedKmh = 0.0
     private var latestRawSpeedKmh: Double? = null
+    private var hasStationaryEvidenceForControl = false
     private var insideTrackArea = true
     private var brakeLineLocation: Location? = null
     private var activeScenarioStepId: String? = null
@@ -525,6 +526,8 @@ class DrivingTrackingService : Service() {
             val dtSec = dtMs / 1000.0
             val speedSample = calculateSpeedSample(previous, location, dtSec, deltaM)
             latestRawSpeedKmh = speedSample.speedKmh.takeIf { speedSample.isValidForControl }
+            hasStationaryEvidenceForControl =
+                speedSample.isValidForControl && speedSample.hasStationaryEvidence
             currentSpeedKmh = smoothSpeedKmh(speedSample.speedKmh)
             val acceptedDeltaM = if (shouldAcceptMovement(location, deltaM, currentSpeedKmh)) {
                 deltaM
@@ -548,6 +551,7 @@ class DrivingTrackingService : Service() {
         } else {
             val speedSample = calculateSpeedSample(null, location, 0.0, 0.0)
             latestRawSpeedKmh = speedSample.speedKmh.takeIf { speedSample.isValidForControl }
+            hasStationaryEvidenceForControl = false
             currentSpeedKmh = smoothSpeedKmh(speedSample.speedKmh)
         }
 
@@ -571,7 +575,13 @@ class DrivingTrackingService : Service() {
         dtSec: Double,
         deltaM: Double
     ): SpeedSample {
-        if (!isUsableLocation(location)) return SpeedSample(0.0, isValidForControl = false)
+        if (!isUsableLocation(location)) {
+            return SpeedSample(
+                speedKmh = 0.0,
+                isValidForControl = false,
+                hasStationaryEvidence = false
+            )
+        }
 
         val hasTrustedGpsSpeed = isTrustedGpsSpeed(location)
         val gpsSpeedKmh = if (hasTrustedGpsSpeed) location.speed.toDouble() * 3.6 else null
@@ -587,11 +597,18 @@ class DrivingTrackingService : Service() {
         }
 
         val rawSpeedKmh = gpsSpeedKmh ?: distanceSpeedKmh ?: 0.0
-        val hasStationaryEvidence =
+        val positionSpeedKmh = if (
             previous != null &&
-                isUsableLocation(previous) &&
-                dtSec >= MIN_SPEED_SAMPLE_SECONDS &&
-                deltaM < STATIONARY_DISTANCE_M
+            isUsableLocation(previous) &&
+            dtSec >= MIN_SPEED_SAMPLE_SECONDS
+        ) {
+            deltaM / dtSec * 3.6
+        } else {
+            null
+        }
+        val hasStationaryEvidence =
+            positionSpeedKmh != null &&
+                positionSpeedKmh <= COMPLETE_STOP_MAX_POSITION_SPEED_KMH
         val normalizedSpeedKmh = if (
             !hasTrustedGpsSpeed &&
             previous != null &&
@@ -606,7 +623,9 @@ class DrivingTrackingService : Service() {
         }
         return SpeedSample(
             speedKmh = normalizedSpeedKmh,
-            isValidForControl = gpsSpeedKmh != null || distanceSpeedKmh != null || hasStationaryEvidence
+            isValidForControl =
+                gpsSpeedKmh != null || distanceSpeedKmh != null || hasStationaryEvidence,
+            hasStationaryEvidence = hasStationaryEvidence
         )
     }
 
@@ -1008,7 +1027,8 @@ class DrivingTrackingService : Service() {
             targetKmh = targetKmh,
             displayedSpeedKmh = currentSpeedKmh,
             latestRawSpeedKmh = latestRawSpeedKmh,
-            toleranceKmh = SPEED_TARGET_TOLERANCE_KMH
+            toleranceKmh = DECELERATION_TARGET_TOLERANCE_KMH,
+            hasStationaryEvidence = hasStationaryEvidenceForControl
         )
     }
 
@@ -1360,13 +1380,15 @@ class DrivingTrackingService : Service() {
         private const val BRAKE_LINE_DETECTION_HALF_WIDTH_M = 25.0
         private const val BRAKE_LINE_HALF_LENGTH_M = 60.0
         private const val SPEED_TARGET_TOLERANCE_KMH = 3.0
+        private const val DECELERATION_TARGET_TOLERANCE_KMH = 6.0
         private const val LOCATION_UPDATE_INTERVAL_MS = 500L
-        private const val LOCATION_UPDATE_MIN_DISTANCE_M = 1f
+        private const val LOCATION_UPDATE_MIN_DISTANCE_M = 0f
         private const val BRAKE_VOICE_REPEAT_DELAY_MS = 1_000L
         private const val ROUTE_POINT_MIN_SPACING_M = 3.0
         private const val STATIONARY_DISTANCE_M = 4.0
         private const val MINIMUM_MOVING_SPEED_KMH = 0.8
         private const val LOW_SPEED_GPS_JITTER_KMH = 12.0
+        private const val COMPLETE_STOP_MAX_POSITION_SPEED_KMH = 3.0
         private const val MIN_SPEED_SAMPLE_SECONDS = 0.5
         private const val MAX_LOCATION_ACCURACY_M = 25f
         private const val MAX_SPEED_ACCURACY_MPS = 1.5f

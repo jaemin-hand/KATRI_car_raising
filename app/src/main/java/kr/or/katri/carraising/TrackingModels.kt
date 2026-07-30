@@ -27,7 +27,8 @@ internal data class BrakeLineFrame(
 
 internal data class SpeedSample(
     val speedKmh: Double,
-    val isValidForControl: Boolean
+    val isValidForControl: Boolean,
+    val hasStationaryEvidence: Boolean
 )
 
 data class TrackingSnapshot(
