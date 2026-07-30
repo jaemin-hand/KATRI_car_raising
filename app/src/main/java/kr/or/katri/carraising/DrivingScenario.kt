@@ -1,8 +1,9 @@
 package kr.or.katri.carraising
 
 enum class PowertrainType(val label: String) {
-    COMBUSTION("내연기관"),
-    HYBRID("하이브리드 차량")
+    COMBUSTION("내연기관 차량"),
+    HYBRID("하이브리드 차량"),
+    ELECTRIC("전기 차량")
 }
 
 enum class ScenarioDriveMode(val label: String) {
@@ -40,6 +41,7 @@ data class DrivingScenarioStep(
 object KatriDrivingScenario {
     const val commonConfiguredEndKm = 3_000.0
     const val testTargetKm = 9_000.0
+    const val electricTestTargetKm = 5_500.0
 
     private val baseSteps: List<DrivingScenarioStep> = listOf(
         constant("A-1", "A", 0.0, 100.0, 60),
@@ -83,12 +85,25 @@ object KatriDrivingScenario {
     }
 
     fun stepAt(distanceKm: Double, powertrainType: PowertrainType): DrivingScenarioStep? {
-        if (!distanceKm.isFinite() || distanceKm < 0.0 || distanceKm >= testTargetKm) return null
+        if (
+            !distanceKm.isFinite() ||
+            distanceKm < 0.0 ||
+            distanceKm >= targetDistanceKm(powertrainType)
+        ) return null
         if (distanceKm < commonConfiguredEndKm) return commonStepAt(distanceKm)
 
         return when (powertrainType) {
             PowertrainType.COMBUSTION -> repeatedHStep(distanceKm)
             PowertrainType.HYBRID -> repeatedBaseStep(distanceKm)
+            PowertrainType.ELECTRIC -> repeatedHStep(distanceKm)
+        }
+    }
+
+    fun targetDistanceKm(powertrainType: PowertrainType): Double {
+        return when (powertrainType) {
+            PowertrainType.ELECTRIC -> electricTestTargetKm
+            PowertrainType.COMBUSTION,
+            PowertrainType.HYBRID -> testTargetKm
         }
     }
 

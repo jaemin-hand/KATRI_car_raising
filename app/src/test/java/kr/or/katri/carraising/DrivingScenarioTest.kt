@@ -62,6 +62,7 @@ class DrivingScenarioTest {
         assertNull(KatriDrivingScenario.commonStepAt(Double.NaN))
         assertNull(KatriDrivingScenario.stepAt(9_000.0, PowertrainType.COMBUSTION))
         assertNull(KatriDrivingScenario.stepAt(9_000.0, PowertrainType.HYBRID))
+        assertNull(KatriDrivingScenario.stepAt(5_500.0, PowertrainType.ELECTRIC))
     }
 
     @Test
@@ -97,5 +98,25 @@ class DrivingScenarioTest {
         val secondCycleA = KatriDrivingScenario.stepAt(5_000.0, PowertrainType.HYBRID)!!
         assertEquals("A-1", secondCycleA.id)
         assertEquals(5_100.0, secondCycleA.endKm, 0.0)
+    }
+
+    @Test
+    fun electricMatchesCombustionScenarioUntilItsTargetDistance() {
+        listOf(0.0, 150.0, 3_000.0, 3_150.0, 5_350.0, 5_499.9).forEach { distanceKm ->
+            val combustion = KatriDrivingScenario.stepAt(distanceKm, PowertrainType.COMBUSTION)
+            val electric = KatriDrivingScenario.stepAt(distanceKm, PowertrainType.ELECTRIC)
+            assertEquals(combustion, electric)
+        }
+    }
+
+    @Test
+    fun electricScenarioEndsAtFiveThousandFiveHundredKm() {
+        assertEquals(
+            5_500.0,
+            KatriDrivingScenario.targetDistanceKm(PowertrainType.ELECTRIC),
+            0.0
+        )
+        assertTrue(KatriDrivingScenario.stepAt(5_499.9, PowertrainType.ELECTRIC) != null)
+        assertNull(KatriDrivingScenario.stepAt(5_500.0, PowertrainType.ELECTRIC))
     }
 }

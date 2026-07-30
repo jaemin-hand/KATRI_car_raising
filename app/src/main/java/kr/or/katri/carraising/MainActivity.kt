@@ -907,7 +907,7 @@ class MainActivity : Activity() {
     }
 
     private fun scenarioInstruction(step: DrivingScenarioStep?): String {
-        if (step == null) return "9000km 시험이 완료되었거나 적용할 시나리오가 없습니다."
+        if (step == null) return "시험이 완료되었거나 적용할 시나리오가 없습니다."
         if (step.driveMode == ScenarioDriveMode.CONSTANT) {
             return "${step.targetSpeedKmh}km/h 정속 유지 · 감속 없음"
         }
@@ -1040,7 +1040,7 @@ class MainActivity : Activity() {
             setPadding(dp(24), dp(24), dp(24), dp(24))
         }
         content.addView(
-            primaryButton("내연기관") {
+            primaryButton("내연기관 차량") {
                 selectPowertrainAndShowTrack(PowertrainType.COMBUSTION)
             },
             largeButton()
@@ -1048,6 +1048,12 @@ class MainActivity : Activity() {
         content.addView(
             primaryButton("하이브리드 차량") {
                 selectPowertrainAndShowTrack(PowertrainType.HYBRID)
+            },
+            largeButton()
+        )
+        content.addView(
+            primaryButton("전기 차량") {
+                selectPowertrainAndShowTrack(PowertrainType.ELECTRIC)
             },
             largeButton()
         )
@@ -1127,7 +1133,12 @@ class MainActivity : Activity() {
             layoutParams = matchParent()
         }
         val root = screenRoot()
-        root.addView(toolbar("고주로 주행", "${selectedPowertrain?.label} / $selectedTestMode"))
+        root.addView(
+            toolbar(
+                "고주로 주행",
+                "${selectedPowertrain?.label} / ${activeTestModeLabel()}"
+            )
+        )
 
         val scroll = ScrollView(this)
         val content = LinearLayout(this).apply {
@@ -1564,6 +1575,9 @@ class MainActivity : Activity() {
 
         val location = currentLocation
         val progressDistanceKm = testProgressDistanceKm()
+        val targetDistanceKm = selectedPowertrain
+            ?.let(KatriDrivingScenario::targetDistanceKm)
+            ?: KatriDrivingScenario.testTargetKm
         if (sessionState != SessionState.Paused) {
             syncScenarioState()
             updateDrivingActionState()
@@ -1578,7 +1592,12 @@ class MainActivity : Activity() {
         tvBrakeLine?.text = brakeLineStatusLabel(scenarioStep)
         if (scenarioStep == null) {
             tvScenarioSection?.text = "시나리오 미설정"
-            tvScenarioProgress?.text = String.format(Locale.US, "현재 %.1fkm · 시험 범위 0~9000km", progressDistanceKm)
+            tvScenarioProgress?.text = String.format(
+                Locale.US,
+                "현재 %.1fkm · 시험 범위 0~%.0fkm",
+                progressDistanceKm,
+                targetDistanceKm
+            )
             tvScenarioTarget?.text = "규정속도 -"
         } else {
             val nextTransitionKm = max(0.0, scenarioStep.endKm - progressDistanceKm)
@@ -1616,6 +1635,17 @@ class MainActivity : Activity() {
             !hasReferenceRoute -> "고주로: 기준 경로 학습 중"
             insideTrackArea -> "고주로: 기준 경로 내"
             else -> "고주로: 기준 경로 이탈"
+        }
+    }
+
+    private fun activeTestModeLabel(): String {
+        return if (
+            selectedPowertrain == PowertrainType.ELECTRIC &&
+            selectedTestMode == "9000km 고주로 주행"
+        ) {
+            "5500km 고주로 주행"
+        } else {
+            selectedTestMode
         }
     }
 
