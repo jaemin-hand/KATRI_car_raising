@@ -10,6 +10,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
+import android.graphics.drawable.Icon
 import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
@@ -50,6 +51,8 @@ class DrivingTrackingService : Service() {
     private var isForeground = false
     private var lastNotificationUpdateMs = 0L
     private var lastStatePersistMs = 0L
+    private var isGpsSignalStale = false
+    private var lastGpsSignalAlertMs = 0L
 
     private var sessionState = SessionState.Idle
     private var selectedPowertrain: PowertrainType? = null
@@ -103,13 +106,33 @@ class DrivingTrackingService : Service() {
     private val statusRefreshRunnable = object : Runnable {
         override fun run() {
             refreshLocationProviderIfNeeded()
-            if (
+            val nowMs = SystemClock.elapsedRealtime()
+            val hasStaleLocation =
                 previousLocationUpdateMs > 0L &&
-                SystemClock.elapsedRealtime() - previousLocationUpdateMs > STALE_SPEED_TIMEOUT_MS &&
-                currentSpeedKmh != 0.0
-            ) {
-                currentSpeedKmh = 0.0
-                notifyListeners()
+                    nowMs - previousLocationUpdateMs > STALE_SPEED_TIMEOUT_MS
+            if (hasStaleLocation) {
+                if (currentSpeedKmh != 0.0) {
+                    currentSpeedKmh = 0.0
+                    notifyListeners()
+                }
+                if (sessionState == SessionState.Running && !isGpsSignalStale) {
+                    isGpsSignalStale = true
+                    if (
+                        lastGpsSignalAlertMs == 0L ||
+                        nowMs - lastGpsSignalAlertMs >= GPS_SIGNAL_ALERT_COOLDOWN_MS
+                    ) {
+                        lastGpsSignalAlertMs = nowMs
+                        showDrivingAlert(
+                            title = "GPS 신호 확인",
+                            message = "위치 정보가 3.5초 이상 갱신되지 않았습니다.",
+                            includeCurrentSpeed = false
+                        )
+                    }
+                } else if (sessionState != SessionState.Running) {
+                    isGpsSignalStale = false
+                }
+            } else {
+                isGpsSignalStale = false
             }
             updateForegroundNotification()
             if (hasBoundClient || isLocationListening || isSessionActive()) {
@@ -447,6 +470,9 @@ class DrivingTrackingService : Service() {
             stopSelf()
             return
         }
+        if (sessionState == SessionState.Running && previousLocationUpdateMs == 0L) {
+            previousLocationUpdateMs = SystemClock.elapsedRealtime()
+        }
         startLocationUpdates()
         notifyListeners()
     }
@@ -519,6 +545,7 @@ class DrivingTrackingService : Service() {
     private fun onLocationUpdated(location: Location) {
         val previous = currentLocation
         val nowMs = SystemClock.elapsedRealtime()
+        isGpsSignalStale = false
 
         if (previous != null) {
             val dtMs = max(1L, nowMs - previousLocationUpdateMs)
@@ -666,6 +693,10 @@ class DrivingTrackingService : Service() {
             val step = currentScenarioStep()
             if (step?.driveMode == ScenarioDriveMode.ACCEL_DECEL) {
                 drivingActionState = DrivingActionState.DECELERATING
+                showDrivingAlert(
+                    title = "브레이크 시작 · ${step.id}",
+                    message = DrivingNotificationContent.brakeAlert(step)
+                )
                 startBrakeVoicePrompt(step)
             } else {
                 drivingActionState = DrivingActionState.CRUISING
@@ -988,12 +1019,27 @@ class DrivingTrackingService : Service() {
         val step = currentScenarioStep()
         if (step?.id == activeScenarioStepId) return
 
+        val previousStepId = activeScenarioStepId
         activeScenarioStepId = step?.id
         drivingActionState = when (step?.driveMode) {
             ScenarioDriveMode.ACCEL_DECEL -> DrivingActionState.WAITING_FOR_BRAKE_LINE
             else -> DrivingActionState.CRUISING
         }
         stopBrakeVoicePrompt()
+
+        if (sessionState == SessionState.Running && previousStepId != null) {
+            if (step == null) {
+                showDrivingAlert(
+                    title = "시험 목표거리 도달",
+                    message = "설정된 주행 시나리오가 완료되었습니다."
+                )
+            } else {
+                showDrivingAlert(
+                    title = "시나리오 전환 · ${step.id}",
+                    message = DrivingNotificationContent.scenarioTransition(step)
+                )
+            }
+        }
     }
 
     private fun updateDrivingActionState() {
@@ -1159,7 +1205,7 @@ class DrivingTrackingService : Service() {
 
     private fun createNotificationChannel() {
         val manager = getSystemService(NotificationManager::class.java)
-        val channel = NotificationChannel(
+        val trackingChannel = NotificationChannel(
             NOTIFICATION_CHANNEL_ID,
             "주행 기록",
             NotificationManager.IMPORTANCE_LOW
@@ -1168,7 +1214,17 @@ class DrivingTrackingService : Service() {
             setSound(null, null)
             enableVibration(false)
         }
-        manager.createNotificationChannel(channel)
+        val alertChannel = NotificationChannel(
+            DRIVING_ALERT_CHANNEL_ID,
+            "주행 경보",
+            NotificationManager.IMPORTANCE_HIGH
+        ).apply {
+            description = "브레이크 시작, 시나리오 전환, GPS 이상 경보"
+            enableVibration(true)
+            vibrationPattern = longArrayOf(0L, 250L, 150L, 250L)
+            lockscreenVisibility = Notification.VISIBILITY_PUBLIC
+        }
+        manager.createNotificationChannels(listOf(trackingChannel, alertChannel))
     }
 
     private fun enterForeground(): Boolean {
@@ -1210,17 +1266,61 @@ class DrivingTrackingService : Service() {
             .notify(NOTIFICATION_ID, buildNotification())
     }
 
-    private fun buildNotification(): Notification {
+    private fun openTrackPendingIntent(): PendingIntent {
         val openIntent = Intent(this, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
             putExtra(EXTRA_OPEN_TRACK, true)
         }
-        val contentIntent = PendingIntent.getActivity(
+        return PendingIntent.getActivity(
             this,
             REQUEST_OPEN_APP,
             openIntent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
+    }
+
+    private fun canPostNotifications(): Boolean {
+        return Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) ==
+            PackageManager.PERMISSION_GRANTED
+    }
+
+    private fun showDrivingAlert(
+        title: String,
+        message: String,
+        includeCurrentSpeed: Boolean = true
+    ) {
+        if (!canPostNotifications()) return
+
+        val scenario = currentScenarioStep()
+        val expandedMessage = buildString {
+            append(message)
+            scenario?.let {
+                append("\n현재 구간: ${it.id} · ${it.driveMode.label}")
+            }
+            if (includeCurrentSpeed) {
+                append(String.format(Locale.US, "\n현재 속도: %.1fkm/h", currentSpeedKmh))
+            }
+            append(String.format(Locale.US, "\n시험 누적거리: %.2fkm", testProgressDistanceKm()))
+        }
+        val notification = Notification.Builder(this, DRIVING_ALERT_CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_stat_tracking)
+            .setContentTitle(title)
+            .setContentText(message)
+            .setStyle(Notification.BigTextStyle().bigText(expandedMessage))
+            .setContentIntent(openTrackPendingIntent())
+            .setCategory(Notification.CATEGORY_EVENT)
+            .setVisibility(Notification.VISIBILITY_PUBLIC)
+            .setAutoCancel(true)
+            .setTimeoutAfter(DRIVING_ALERT_TIMEOUT_MS)
+            .build()
+
+        getSystemService(NotificationManager::class.java)
+            .notify(DRIVING_ALERT_NOTIFICATION_ID, notification)
+    }
+
+    private fun buildNotification(): Notification {
+        val contentIntent = openTrackPendingIntent()
 
         val toggleIntent = Intent(this, DrivingTrackingService::class.java)
             .setAction(ACTION_TOGGLE_PAUSE)
@@ -1242,38 +1342,54 @@ class DrivingTrackingService : Service() {
         val scenario = currentScenarioStep()
         val title = when (sessionState) {
             SessionState.Paused -> "KATRI ODO 기록 중 · 주행 일시정지"
-            else -> "KATRI 주행 기록 중"
+            else -> scenario?.let { "KATRI 주행 중 · ${it.id}" } ?: "KATRI 주행 기록 중"
         }
-        val detail = String.format(
-            Locale.US,
-            "속도 %.1fkm/h · 시험 %.2fkm%s",
-            currentSpeedKmh,
-            testProgressDistanceKm(),
-            scenario?.let { " · ${it.id}" }.orEmpty()
+        val status = DrivingNotificationContent.status(
+            sessionState = sessionState,
+            speedKmh = currentSpeedKmh,
+            progressDistanceKm = testProgressDistanceKm(),
+            step = scenario,
+            actionState = drivingActionState
         )
+        val expandedStyle = Notification.InboxStyle()
+            .setBigContentTitle(title)
+        status.expandedLines.forEach { expandedStyle.addLine(it) }
+        status.summaryText?.let { expandedStyle.setSummaryText(it) }
 
         return Notification.Builder(this, NOTIFICATION_CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_stat_tracking)
             .setContentTitle(title)
-            .setContentText(detail)
+            .setContentText(status.compactText)
+            .setStyle(expandedStyle)
             .setContentIntent(contentIntent)
             .setCategory(Notification.CATEGORY_SERVICE)
+            .setVisibility(Notification.VISIBILITY_PUBLIC)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .setShowWhen(false)
             .addAction(
-                if (sessionState == SessionState.Paused) {
-                    android.R.drawable.ic_media_play
-                } else {
-                    android.R.drawable.ic_media_pause
-                },
-                if (sessionState == SessionState.Paused) "재개" else "일시정지",
-                togglePendingIntent
+                Notification.Action.Builder(
+                    Icon.createWithResource(
+                        this,
+                        if (sessionState == SessionState.Paused) {
+                            android.R.drawable.ic_media_play
+                        } else {
+                            android.R.drawable.ic_media_pause
+                        }
+                    ),
+                    if (sessionState == SessionState.Paused) "재개" else "일시정지",
+                    togglePendingIntent
+                ).build()
             )
             .addAction(
-                android.R.drawable.ic_menu_close_clear_cancel,
-                "시험 종료",
-                stopPendingIntent
+                Notification.Action.Builder(
+                    Icon.createWithResource(
+                        this,
+                        android.R.drawable.ic_menu_close_clear_cancel
+                    ),
+                    "시험 종료",
+                    stopPendingIntent
+                ).build()
             )
             .build()
     }
@@ -1353,7 +1469,9 @@ class DrivingTrackingService : Service() {
         private const val EXTRA_TRACK_ODO = "track_odo"
 
         private const val NOTIFICATION_CHANNEL_ID = "katri_driving_tracking"
+        private const val DRIVING_ALERT_CHANNEL_ID = "katri_driving_alerts"
         private const val NOTIFICATION_ID = 2401
+        private const val DRIVING_ALERT_NOTIFICATION_ID = 2405
         private const val REQUEST_OPEN_APP = 2402
         private const val REQUEST_TOGGLE_PAUSE = 2403
         private const val REQUEST_STOP_SESSION = 2404
@@ -1394,6 +1512,8 @@ class DrivingTrackingService : Service() {
         private const val MAX_SPEED_ACCURACY_MPS = 1.5f
         private const val SPEED_SMOOTHING_ALPHA = 0.35
         private const val STALE_SPEED_TIMEOUT_MS = 3_500L
+        private const val GPS_SIGNAL_ALERT_COOLDOWN_MS = 60_000L
+        private const val DRIVING_ALERT_TIMEOUT_MS = 10_000L
         private const val REFERENCE_ROUTE_TOLERANCE_M = 120.0
         private const val REFERENCE_ROUTE_MIN_POINTS = 80
         private const val REFERENCE_ROUTE_MIN_DISTANCE_M = 4_000.0

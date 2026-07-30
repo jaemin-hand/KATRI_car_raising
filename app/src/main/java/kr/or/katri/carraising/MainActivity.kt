@@ -680,17 +680,65 @@ class MainActivity : Activity() {
             )
         )
 
-        val scroll = ScrollView(this)
-        val content = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(14), dp(14), dp(14), dp(22))
-        }
-
+        val body = FrameLayout(this)
         previewView = TrackPreviewView(this).also { view ->
             view.setReferenceRoute(referenceRoutePoints)
             view.setBrakeLine(brakeLineLocation?.latitude, brakeLineLocation?.longitude)
-            content.addView(view, fullWidthHeight(dp(230)))
+            view.setBackgroundPresentation(true)
+            view.isClickable = false
+            view.isFocusable = false
+            view.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+            body.addView(
+                view,
+                FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT
+                )
+            )
         }
+
+        val scroll = ScrollView(this).apply {
+            isFillViewport = true
+            setBackgroundColor(Color.TRANSPARENT)
+        }
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(14), dp(14), dp(14), dp(22))
+            setBackgroundColor(Color.TRANSPARENT)
+        }
+
+        content.addView(sectionTitle("측정"))
+
+        tvSpeed = metricTextView("0.0 km/h").apply {
+            textSize = 24f
+        }
+        tvDistance = metricTextView("0.00 km").apply {
+            textSize = 21f
+        }
+        tvStatus = metricTextView(currentStatusLabel())
+        tvBoundary = metricTextView("고주로: 확인 중")
+        tvBrakeLine = metricTextView("브레이크 시작선: 미설정")
+
+        content.addView(
+            metricRow(
+                metricCard("속도", tvSpeed!!).apply {
+                    background = trackSurfaceBackground()
+                },
+                metricCard("시험 누적거리", tvDistance!!).apply {
+                    background = trackSurfaceBackground()
+                }
+            )
+        )
+        content.addView(
+            cardContainer().apply {
+                orientation = LinearLayout.VERTICAL
+                background = trackSurfaceBackground()
+                setPadding(dp(4), dp(6), dp(4), dp(6))
+                addView(tvStatus)
+                addView(tvBoundary)
+                addView(tvBrakeLine)
+            }
+        )
 
         content.addView(sectionTitle("현재 시나리오"))
         tvScenarioSection = metricTextView("A-1 · 정속")
@@ -700,6 +748,7 @@ class MainActivity : Activity() {
         content.addView(
             cardContainer().apply {
                 orientation = LinearLayout.VERTICAL
+                background = trackSurfaceBackground()
                 setPadding(dp(12), dp(10), dp(12), dp(10))
                 addView(tvScenarioSection)
                 addView(tvScenarioProgress)
@@ -707,20 +756,6 @@ class MainActivity : Activity() {
                 addView(tvScenarioInstruction)
             }
         )
-        content.addView(sectionTitle("측정"))
-
-        tvSpeed = metricTextView("0.0 km/h")
-        tvDistance = metricTextView("0.00 km")
-        tvStatus = metricTextView(currentStatusLabel())
-        tvBoundary = metricTextView("고주로: 확인 중")
-        tvBrakeLine = metricTextView("브레이크 시작선: 미설정")
-
-        content.addView(metricRow(metricCard("속도", tvSpeed!!), metricCard("시험 누적거리", tvDistance!!)))
-        content.addView(tvStatus)
-        content.addView(space(dp(6)))
-        content.addView(tvBoundary)
-        content.addView(tvBrakeLine)
-        content.addView(space(dp(10)))
 
         content.addView(sectionTitle("ODO"))
         content.addView(formLabel("현재 ODO"))
@@ -864,7 +899,14 @@ class MainActivity : Activity() {
 
         updateControlButtons()
         scroll.addView(content)
-        root.addView(scroll, weightedContent())
+        body.addView(
+            scroll,
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT
+            )
+        )
+        root.addView(body, weightedContent())
         container.addView(root, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         redFlashOverlay = View(this).apply {
             setBackgroundColor(Color.argb(170, 220, 38, 38))
@@ -1363,6 +1405,14 @@ class MainActivity : Activity() {
     }
 
     private fun inputBackground(): android.graphics.drawable.GradientDrawable = rounded(Color.WHITE, dp(8), ScreenColors.Border)
+
+    private fun trackSurfaceBackground(): android.graphics.drawable.GradientDrawable {
+        return rounded(
+            Color.argb(238, 255, 255, 255),
+            dp(8),
+            Color.argb(190, 203, 213, 225)
+        )
+    }
     private fun cardContainer(): LinearLayout = LinearLayout(this).apply {
         background = rounded(Color.WHITE, dp(8), ScreenColors.Border)
         layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
@@ -1376,9 +1426,6 @@ class MainActivity : Activity() {
     }
     private fun largeButton(): LinearLayout.LayoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(116)).apply {
         topMargin = dp(16)
-    }
-    private fun fullWidthHeight(height: Int): LinearLayout.LayoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, height).apply {
-        bottomMargin = dp(8)
     }
     private fun weightedContent(): LinearLayout.LayoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
     private fun matchParent(): ViewGroup.LayoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
@@ -1450,6 +1497,12 @@ private class TrackPreviewView(context: android.content.Context) : View(context)
     private var brakeLine: GeoPoint? = null
     private var inTrack = true
     private var running = false
+    private var backgroundPresentation = false
+
+    fun setBackgroundPresentation(enabled: Boolean) {
+        backgroundPresentation = enabled
+        invalidate()
+    }
 
     fun setState(
         isInTrack: Boolean,
@@ -1503,6 +1556,7 @@ private class TrackPreviewView(context: android.content.Context) : View(context)
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
         if (width <= 0 || height <= 0) return
+        applyPresentationAlphas()
 
         val baseRoute = if (referenceRoute.isNotEmpty()) referenceRoute else currentRoute
         if (baseRoute.isEmpty()) {
@@ -1512,9 +1566,13 @@ private class TrackPreviewView(context: android.content.Context) : View(context)
                 val endX = width * 0.75f
                 canvas.drawLine(startX, centerY, endX, centerY, brakeLineOutlinePaint)
                 canvas.drawLine(startX, centerY, endX, centerY, brakeLinePaint)
-                canvas.drawText("브레이크 시작선", width * 0.5f, centerY - dp(8), brakeLabelPaint)
+                if (!backgroundPresentation) {
+                    canvas.drawText("브레이크 시작선", width * 0.5f, centerY - dp(8), brakeLabelPaint)
+                }
             }
-            canvas.drawText("첫 랩 GPS 경로 수집 대기", dp(16).toFloat(), dp(20).toFloat(), labelPaint)
+            if (!backgroundPresentation) {
+                canvas.drawText("첫 랩 GPS 경로 수집 대기", dp(16).toFloat(), dp(20).toFloat(), labelPaint)
+            }
             return
         }
 
@@ -1531,13 +1589,16 @@ private class TrackPreviewView(context: android.content.Context) : View(context)
 
         if (projectedReference.size >= 2) {
             drawRoute(canvas, projectedReference, transform, referencePaint, closePath = true)
-            canvas.drawText("첫 랩 기준 경로", dp(12).toFloat(), dp(18).toFloat(), labelPaint)
-        } else {
+            if (!backgroundPresentation) {
+                canvas.drawText("첫 랩 기준 경로", dp(12).toFloat(), dp(18).toFloat(), labelPaint)
+            }
+        } else if (!backgroundPresentation) {
             canvas.drawText("첫 랩 기준 경로 수집 중", dp(12).toFloat(), dp(18).toFloat(), labelPaint)
         }
 
         if (projectedCurrent.size >= 2) {
             routePaint.color = if (inTrack) ScreenColors.Primary else Color.rgb(239, 68, 68)
+            routePaint.alpha = if (backgroundPresentation) 78 else 255
             drawRoute(canvas, projectedCurrent, transform, routePaint, closePath = false)
         }
 
@@ -1550,6 +1611,18 @@ private class TrackPreviewView(context: android.content.Context) : View(context)
             canvas.drawCircle(mapped.x, mapped.y, dp(7).toFloat(), currentLocationOutlinePaint)
             canvas.drawCircle(mapped.x, mapped.y, dp(4).toFloat(), currentLocationPaint)
         }
+    }
+
+    private fun applyPresentationAlphas() {
+        val backgroundAlpha = backgroundPresentation
+        referencePaint.alpha = if (backgroundAlpha) 52 else 255
+        routePaint.alpha = if (backgroundAlpha) 78 else 255
+        brakeLineOutlinePaint.alpha = if (backgroundAlpha) 190 else 255
+        brakeLinePaint.alpha = if (backgroundAlpha) 170 else 255
+        currentLocationOutlinePaint.alpha = if (backgroundAlpha) 210 else 255
+        currentLocationPaint.alpha = if (backgroundAlpha) 165 else 255
+        labelPaint.alpha = if (backgroundAlpha) 0 else 255
+        brakeLabelPaint.alpha = if (backgroundAlpha) 0 else 255
     }
 
     private fun drawRoute(
@@ -1614,8 +1687,10 @@ private class TrackPreviewView(context: android.content.Context) : View(context)
         canvas.drawLine(mappedStart.x, mappedStart.y, mappedEnd.x, mappedEnd.y, brakeLineOutlinePaint)
         canvas.drawLine(mappedStart.x, mappedStart.y, mappedEnd.x, mappedEnd.y, brakeLinePaint)
 
-        val mappedCenter = mapToView(center, transform)
-        canvas.drawText("브레이크 시작선", mappedCenter.x, mappedCenter.y - dp(8), brakeLabelPaint)
+        if (!backgroundPresentation) {
+            val mappedCenter = mapToView(center, transform)
+            canvas.drawText("브레이크 시작선", mappedCenter.x, mappedCenter.y - dp(8), brakeLabelPaint)
+        }
     }
 
     private fun viewTransform(points: List<PointF>): ViewTransform {
