@@ -25,6 +25,7 @@ import android.text.InputType
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.view.WindowManager
 import android.view.inputmethod.InputMethodManager
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
@@ -119,6 +120,7 @@ class MainActivity : Activity() {
     private var tvStatus: TextView? = null
     private var tvBoundary: TextView? = null
     private var tvBrakeLine: TextView? = null
+    private var tvCurrentOdo: TextView? = null
     private var tvScenarioSection: TextView? = null
     private var tvScenarioProgress: TextView? = null
     private var tvScenarioTarget: TextView? = null
@@ -181,6 +183,7 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         loadReferenceRoute()
         loadBrakeLine()
         initLocationListener()
@@ -463,19 +466,26 @@ class MainActivity : Activity() {
             currentSpeedKmh = smoothSpeedKmh(speedSample.speedKmh)
             val acceptedDeltaM = if (shouldAcceptMovement(location, deltaM, currentSpeedKmh)) deltaM else 0.0
 
-            if (sessionState == SessionState.Running && acceptedDeltaM > 0.0) {
+            val isTrackingOdo =
+                sessionState == SessionState.Running || sessionState == SessionState.Paused
+            if (isTrackingOdo && acceptedDeltaM > 0.0) {
                 totalDistanceM += acceptedDeltaM
-                syncScenarioState()
+            }
+            if (sessionState == SessionState.Running && acceptedDeltaM > 0.0) {
                 appendCurrentRoutePoint(location)
-                evaluateLap(location)
-                updateDrivingActionState()
                 updateTrackAreaState(location)
                 previewView?.setState(
                     isInTrack = insideTrackArea,
-                    isRunning = sessionState == SessionState.Running,
+                    isRunning = true,
                     latitude = location.latitude,
                     longitude = location.longitude
                 )
+                syncScenarioState()
+                evaluateLap(location)
+                updateDrivingActionState()
+            }
+            if (sessionState == SessionState.Paused) {
+                updatePausedBrakeLineState(location)
             }
             previousLocationUpdateMs = nowMs
         } else {
@@ -630,6 +640,14 @@ class MainActivity : Activity() {
         } else if (wasInBrakeLineGate && !inGate) {
             wasInBrakeLineGate = false
         }
+    }
+
+    private fun updatePausedBrakeLineState(location: Location) {
+        val inGate = isInBrakeLineGate(location)
+        if (!wasInBrakeLineGate && inGate) {
+            lastGateDistanceM = totalDistanceM
+        }
+        wasInBrakeLineGate = inGate
     }
 
     private fun triggerLapAlarm(step: DrivingScenarioStep) {
@@ -1157,14 +1175,15 @@ class MainActivity : Activity() {
         content.addView(formLabel("현재 ODO"))
         val trackOdoInput = numberInput("ODO (km)")
         val initialTrackOdo = selectedTrackOdo.ifEmpty { selectedStartOdo }
-        val trackOdoSavedText = TextView(this).apply {
-            text = savedOdoLabel(initialTrackOdo)
+        tvCurrentOdo = TextView(this).apply {
+            text = currentOdoLabel()
             textSize = 16f
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(ScreenColors.Text)
             gravity = Gravity.CENTER_VERTICAL
             setPadding(dp(14), 0, dp(14), 0)
         }
+        val trackOdoSavedText = tvCurrentOdo!!
         if (initialTrackOdo.isNotEmpty()) {
             trackOdoInput.setText(initialTrackOdo)
             trackOdoInput.setSelection(trackOdoInput.text.length)
@@ -1179,7 +1198,8 @@ class MainActivity : Activity() {
         trackOdoActionButton.setOnClickListener {
             if (!isTrackOdoEditing) {
                 isTrackOdoEditing = true
-                val savedOdo = selectedTrackOdo.ifEmpty { selectedStartOdo }
+                val savedOdo = currentOdoKmOrNull()?.let(::formatOdoInput)
+                    ?: selectedTrackOdo.ifEmpty { selectedStartOdo }
                 trackOdoInput.setText(savedOdo)
                 trackOdoInput.setSelection(trackOdoInput.text.length)
                 updateTrackOdoMode()
@@ -1207,7 +1227,7 @@ class MainActivity : Activity() {
             odoConfirmedAtSessionDistanceM = totalDistanceM
             activeScenarioStepId = null
             syncScenarioState()
-            trackOdoSavedText.text = savedOdoLabel(selectedTrackOdo)
+            trackOdoSavedText.text = currentOdoLabel()
             isTrackOdoEditing = false
             trackOdoInput.clearFocus()
             (getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager)
@@ -1227,8 +1247,13 @@ class MainActivity : Activity() {
         content.addView(trackOdoRow)
         content.addView(space(dp(10)))
 
-        btnSetBrakeLine = secondaryButton("현재 위치를 브레이크 시작선으로 설정") {
-            requestLocationPermission { setBrakeLine() }
+        btnSetBrakeLine = secondaryButton("브레이크 시작선 수동 설정") {
+            setBrakeLine()
+        }.apply {
+            textSize = 13f
+            minWidth = 0
+            minimumWidth = 0
+            setPadding(dp(12), 0, dp(12), 0)
         }
         btnStartPause = primaryButton("주행 시작") {
             when (sessionState) {
@@ -1245,7 +1270,6 @@ class MainActivity : Activity() {
             }
         }
 
-        content.addView(btnSetBrakeLine, compactFullWidth())
         content.addView(
             LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
@@ -1253,6 +1277,17 @@ class MainActivity : Activity() {
                 addView(btnStop, LinearLayout.LayoutParams(0, dp(56), 1f).apply { leftMargin = dp(8) })
             },
             compactFullWidth()
+        )
+        content.addView(
+            LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.END
+                addView(
+                    btnSetBrakeLine,
+                    LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(44))
+                )
+            },
+            fullWidth()
         )
 
         updateControlButtons()
@@ -1342,9 +1377,28 @@ class MainActivity : Activity() {
     }
 
     private fun startSession() {
-        if (brakeLineLocation == null) {
-            Toast.makeText(this, "브레이크 시작선을 먼저 설정하세요.", Toast.LENGTH_SHORT).show()
+        if (!hasLocationPermission()) {
+            requestLocationPermission {
+                startLocationUpdates()
+                startSession()
+            }
             return
+        }
+
+        var brakeLineWasSetAutomatically = false
+        if (brakeLineLocation == null) {
+            val now = currentLocation
+            if (now == null) {
+                Toast.makeText(this, "GPS 위치를 수신 중입니다. 잠시 후 다시 시작하세요.", Toast.LENGTH_SHORT).show()
+                return
+            }
+            val locationIssue = brakeLineLocationIssue(now)
+            if (locationIssue != null) {
+                Toast.makeText(this, locationIssue, Toast.LENGTH_SHORT).show()
+                return
+            }
+            applyBrakeLine(now)
+            brakeLineWasSetAutomatically = true
         }
         if (sessionState == SessionState.Idle || sessionState == SessionState.Ready || sessionState == SessionState.Finished) {
             stopRedFlashLoop()
@@ -1368,6 +1422,9 @@ class MainActivity : Activity() {
         syncScenarioState()
         updateControlButtons()
         updateTrackUi()
+        if (brakeLineWasSetAutomatically) {
+            Toast.makeText(this, "현재 위치를 브레이크 시작선으로 설정하고 주행을 시작했습니다.", Toast.LENGTH_SHORT).show()
+        }
     }
 
     private fun pauseSession() {
@@ -1425,27 +1482,55 @@ class MainActivity : Activity() {
                 Toast.makeText(this, "현재 위치를 사용할 수 없습니다.", Toast.LENGTH_SHORT).show()
                 return@requestLocationPermission
             }
-            brakeLineLocation = Location(now)
-            saveBrakeLine()
-            sessionState = SessionState.Ready
-            totalDistanceM = 0.0
-            lastGateDistanceM = 0.0
-            wasInBrakeLineGate = true
-            currentSpeedKmh = 0.0
-            latestRawSpeedKmh = null
-            odoConfirmedAtSessionDistanceM = 0.0
-            activeScenarioStepId = null
-            drivingActionState = DrivingActionState.CRUISING
-            stopRedFlashLoop()
-            currentRoutePoints.clear()
-            previewView?.clearPath()
-            previewView?.setBrakeLine(now.latitude, now.longitude)
-            previewView?.setState(isInTrack = true, isRunning = false)
-            tvBrakeLine?.text = "브레이크 시작선: 설정됨"
-            updateControlButtons()
-            updateTrackUi()
+            val locationIssue = brakeLineLocationIssue(now)
+            if (locationIssue != null) {
+                Toast.makeText(this, locationIssue, Toast.LENGTH_SHORT).show()
+                return@requestLocationPermission
+            }
+            applyBrakeLine(now)
             Toast.makeText(this, "브레이크 시작선이 설정되었습니다.", Toast.LENGTH_SHORT).show()
         }
+    }
+
+    private fun applyBrakeLine(location: Location) {
+        brakeLineLocation = Location(location)
+        saveBrakeLine()
+        sessionState = SessionState.Ready
+        totalDistanceM = 0.0
+        lastGateDistanceM = 0.0
+        wasInBrakeLineGate = true
+        currentSpeedKmh = 0.0
+        latestRawSpeedKmh = null
+        odoConfirmedAtSessionDistanceM = 0.0
+        activeScenarioStepId = null
+        drivingActionState = DrivingActionState.CRUISING
+        stopRedFlashLoop()
+        currentRoutePoints.clear()
+        previewView?.clearPath()
+        previewView?.setBrakeLine(location.latitude, location.longitude)
+        previewView?.setState(isInTrack = true, isRunning = false)
+        tvBrakeLine?.text = "브레이크 시작선: 설정됨"
+        updateControlButtons()
+        updateTrackUi()
+    }
+
+    private fun brakeLineLocationIssue(location: Location): String? {
+        if (location.provider != LocationManager.GPS_PROVIDER) {
+            return "브레이크 시작선 설정을 위해 GPS 신호가 필요합니다."
+        }
+        if (!location.hasAccuracy() || location.accuracy > maxLocationAccuracyM) {
+            return "GPS 정확도가 낮습니다. 신호가 안정된 후 다시 시작하세요."
+        }
+        val locationAgeMs = if (location.elapsedRealtimeNanos > 0L) {
+            (SystemClock.elapsedRealtimeNanos() - location.elapsedRealtimeNanos)
+                .coerceAtLeast(0L) / 1_000_000L
+        } else {
+            0L
+        }
+        if (locationAgeMs > staleSpeedTimeoutMs) {
+            return "최신 GPS 위치를 기다리는 중입니다. 잠시 후 다시 시작하세요."
+        }
+        return null
     }
 
     private fun updateControlButtons() {
@@ -1456,9 +1541,10 @@ class MainActivity : Activity() {
         }
         btnStartPause?.text = startLabel
         btnStop?.text = if (sessionState == SessionState.Finished) "초기화" else "정지"
-        btnSetBrakeLine?.isEnabled = sessionState != SessionState.Running
+        btnSetBrakeLine?.isEnabled =
+            sessionState != SessionState.Running && sessionState != SessionState.Paused
         btnSetBrakeLine?.text = if (brakeLineLocation == null) {
-            "현재 위치를 브레이크 시작선으로 설정"
+            "브레이크 시작선 수동 설정"
         } else {
             "브레이크 시작선 재설정"
         }
@@ -1466,7 +1552,7 @@ class MainActivity : Activity() {
 
     private fun updateTrackUi() {
         if (
-            sessionState == SessionState.Running &&
+            (sessionState == SessionState.Running || sessionState == SessionState.Paused) &&
             previousLocationUpdateMs > 0L &&
             SystemClock.elapsedRealtime() - previousLocationUpdateMs > staleSpeedTimeoutMs
         ) {
@@ -1478,12 +1564,15 @@ class MainActivity : Activity() {
 
         val location = currentLocation
         val progressDistanceKm = testProgressDistanceKm()
-        syncScenarioState()
-        updateDrivingActionState()
+        if (sessionState != SessionState.Paused) {
+            syncScenarioState()
+            updateDrivingActionState()
+        }
         val scenarioStep = currentScenarioStep()
 
         tvSpeed?.text = String.format(Locale.US, "%.1f km/h", currentSpeedKmh)
         tvDistance?.text = String.format(Locale.US, "%.2f km", progressDistanceKm)
+        tvCurrentOdo?.text = currentOdoLabel()
         tvStatus?.text = currentStatusLabel()
         tvBoundary?.text = trackAreaLabel()
         tvBrakeLine?.text = brakeLineStatusLabel(scenarioStep)
@@ -1530,8 +1619,22 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun savedOdoLabel(odo: String): String {
-        return if (odo.isBlank()) "저장 ODO: 미입력" else "저장 ODO: $odo km"
+    private fun currentOdoKmOrNull(): Double? {
+        val confirmedOdo = selectedTrackOdo.ifEmpty { selectedStartOdo }.toDoubleOrNull()
+        return OdometerRules.currentOdoKm(
+            confirmedOdoKm = confirmedOdo,
+            trackedDistanceM = totalDistanceM,
+            confirmationDistanceM = odoConfirmedAtSessionDistanceM
+        )
+    }
+
+    private fun currentOdoLabel(): String {
+        val currentOdo = currentOdoKmOrNull() ?: return "현재 ODO: 미입력"
+        return String.format(Locale.US, "현재 ODO: %.2f km", currentOdo)
+    }
+
+    private fun formatOdoInput(odoKm: Double): String {
+        return String.format(Locale.US, "%.2f", odoKm).trimEnd('0').trimEnd('.')
     }
 
     private fun brakeLineStatusLabel(step: DrivingScenarioStep?): String {
