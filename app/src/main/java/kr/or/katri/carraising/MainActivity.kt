@@ -72,6 +72,7 @@ class MainActivity : Activity() {
     private var insideTrackArea = true
     private var brakeLineLocation: Location? = null
     private var drivingActionState = DrivingActionState.CRUISING
+    private var speedGuidance: SpeedGuidance? = null
     private var odoConfirmedAtSessionDistanceM = 0.0
 
     private val currentRoutePoints = ArrayList<GeoPoint>()
@@ -95,7 +96,6 @@ class MainActivity : Activity() {
 
     private var previewView: TrackPreviewView? = null
     private var tvSpeed: TextView? = null
-    private var tvDistance: TextView? = null
     private var tvStatus: TextView? = null
     private var tvBoundary: TextView? = null
     private var tvBrakeLine: TextView? = null
@@ -104,7 +104,7 @@ class MainActivity : Activity() {
     private var tvScenarioProgress: TextView? = null
     private var tvScenarioTarget: TextView? = null
     private var tvScenarioInstruction: TextView? = null
-    private var redFlashOverlay: View? = null
+    private var alertFlashOverlay: View? = null
 
     private var btnSetBrakeLine: Button? = null
     private var btnClearBrakeLine: Button? = null
@@ -116,11 +116,11 @@ class MainActivity : Activity() {
     private var selectedStartOdo = ""
     private var selectedTrackOdo = ""
 
-    private var isRedFlashLoopActive = false
+    private var isAlertFlashLoopActive = false
 
-    private val redFlashLoopRunnable = object : Runnable {
+    private val alertFlashLoopRunnable = object : Runnable {
         override fun run() {
-            runRedFlashPulse()
+            runAlertFlashPulse()
         }
     }
 
@@ -179,13 +179,13 @@ class MainActivity : Activity() {
         uiHandler.removeCallbacks(uiUpdateRunnable)
         uiHandler.post(uiUpdateRunnable)
         updateTrackUi()
-        syncRedFlashFromTrackingState()
+        syncAlertFlashFromTrackingState()
     }
 
     override fun onPause() {
         super.onPause()
         uiHandler.removeCallbacks(uiUpdateRunnable)
-        stopRedFlashLoop()
+        stopAlertFlashLoop()
     }
 
     override fun onStop() {
@@ -199,7 +199,7 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
-        stopRedFlashLoop()
+        stopAlertFlashLoop()
         super.onDestroy()
     }
 
@@ -247,6 +247,7 @@ class MainActivity : Activity() {
             }
         }
         drivingActionState = snapshot.drivingActionState
+        speedGuidance = snapshot.speedGuidance
         odoConfirmedAtSessionDistanceM = snapshot.odoConfirmedAtSessionDistanceM
         currentRoutePoints.clear()
         currentRoutePoints.addAll(snapshot.currentRoutePoints)
@@ -272,7 +273,7 @@ class MainActivity : Activity() {
         if (currentScreen == Screen.Track) {
             updateTrackUi()
         }
-        syncRedFlashFromTrackingState()
+        syncAlertFlashFromTrackingState()
         updateControlButtons()
         openRequestedTrackIfReady()
     }
@@ -288,16 +289,21 @@ class MainActivity : Activity() {
         if (currentScreen != Screen.Track) showTrack()
     }
 
-    private fun syncRedFlashFromTrackingState() {
-        if (
-            currentScreen == Screen.Track &&
-            sessionState == SessionState.Running &&
-            drivingActionState == DrivingActionState.DECELERATING
-        ) {
-            startRedFlashLoop()
-        } else {
-            stopRedFlashLoop()
+    private fun syncAlertFlashFromTrackingState() {
+        val flashColor = when {
+            currentScreen != Screen.Track || sessionState != SessionState.Running -> null
+            drivingActionState == DrivingActionState.DECELERATING ->
+                Color.argb(170, 220, 38, 38)
+            speedGuidance != null -> Color.argb(170, 245, 158, 11)
+            else -> null
         }
+        if (flashColor == null) {
+            stopAlertFlashLoop()
+            return
+        }
+
+        alertFlashOverlay?.setBackgroundColor(flashColor)
+        startAlertFlashLoop()
     }
 
     private fun hasLocationPermission(): Boolean {
@@ -369,26 +375,26 @@ class MainActivity : Activity() {
         )
     }
 
-    private fun startRedFlashLoop() {
-        if (redFlashOverlay == null) return
-        if (isRedFlashLoopActive) return
-        isRedFlashLoopActive = true
-        uiHandler.removeCallbacks(redFlashLoopRunnable)
-        redFlashLoopRunnable.run()
+    private fun startAlertFlashLoop() {
+        if (alertFlashOverlay == null) return
+        if (isAlertFlashLoopActive) return
+        isAlertFlashLoopActive = true
+        uiHandler.removeCallbacks(alertFlashLoopRunnable)
+        alertFlashLoopRunnable.run()
     }
 
-    private fun stopRedFlashLoop() {
-        isRedFlashLoopActive = false
-        uiHandler.removeCallbacks(redFlashLoopRunnable)
-        redFlashOverlay?.animate()?.cancel()
-        redFlashOverlay?.alpha = 0f
-        redFlashOverlay?.visibility = View.GONE
+    private fun stopAlertFlashLoop() {
+        isAlertFlashLoopActive = false
+        uiHandler.removeCallbacks(alertFlashLoopRunnable)
+        alertFlashOverlay?.animate()?.cancel()
+        alertFlashOverlay?.alpha = 0f
+        alertFlashOverlay?.visibility = View.GONE
     }
 
-    private fun runRedFlashPulse() {
-        if (!isRedFlashLoopActive) return
-        val overlay = redFlashOverlay ?: run {
-            isRedFlashLoopActive = false
+    private fun runAlertFlashPulse() {
+        if (!isAlertFlashLoopActive) return
+        val overlay = alertFlashOverlay ?: run {
+            isAlertFlashLoopActive = false
             return
         }
         overlay.animate().cancel()
@@ -403,7 +409,9 @@ class MainActivity : Activity() {
                     .setDuration(520L)
                     .withEndAction {
                         overlay.visibility = View.GONE
-                        if (isRedFlashLoopActive) uiHandler.postDelayed(redFlashLoopRunnable, 180L)
+                        if (isAlertFlashLoopActive) {
+                            uiHandler.postDelayed(alertFlashLoopRunnable, 180L)
+                        }
                     }
                     .start()
             }
@@ -450,7 +458,7 @@ class MainActivity : Activity() {
     }
 
     private fun showHome() {
-        stopRedFlashLoop()
+        stopAlertFlashLoop()
         currentScreen = Screen.Home
         setContentView(createHomeView())
     }
@@ -461,7 +469,7 @@ class MainActivity : Activity() {
     }
 
     private fun showPowertrainSelection() {
-        stopRedFlashLoop()
+        stopAlertFlashLoop()
         currentScreen = Screen.PowertrainSelection
         setContentView(createPowertrainSelectionView())
     }
@@ -479,7 +487,7 @@ class MainActivity : Activity() {
             requestLocationPermission { trackingService?.startPreviewTracking() }
         }
         updateTrackUi()
-        syncRedFlashFromTrackingState()
+        syncAlertFlashFromTrackingState()
     }
 
     private fun createHomeView(): FrameLayout {
@@ -509,8 +517,6 @@ class MainActivity : Activity() {
             setImageResource(R.drawable.app_logo)
             scaleType = ImageView.ScaleType.FIT_CENTER
             contentDescription = getString(R.string.app_name)
-            setPadding(dp(8), dp(8), dp(8), dp(8))
-            background = rounded(Color.WHITE, dp(8), ScreenColors.Border)
         }
         content.addView(
             logo,
@@ -554,6 +560,24 @@ class MainActivity : Activity() {
             ).apply {
                 topMargin = dp(20)
                 rightMargin = dp(20)
+            }
+        )
+
+        val appCredits = TextView(this).apply {
+            text = "version ${BuildConfig.VERSION_NAME}\nmade by jmson@infomagix.com"
+            textSize = 10f
+            setTextColor(ScreenColors.MutedText)
+            gravity = Gravity.END
+        }
+        root.addView(
+            appCredits,
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.BOTTOM or Gravity.END
+            ).apply {
+                rightMargin = dp(20)
+                bottomMargin = dp(20)
             }
         )
         return root
@@ -712,9 +736,137 @@ class MainActivity : Activity() {
         tvSpeed = metricTextView("0.0 km/h").apply {
             textSize = 24f
         }
-        tvDistance = metricTextView("0.00 km").apply {
-            textSize = 21f
+        val trackOdoInput = numberInput("ODO (km)").apply {
+            textSize = 14f
+            setPadding(dp(10), 0, dp(10), 0)
         }
+        val initialTrackOdo = selectedTrackOdo.ifEmpty { selectedStartOdo }
+        tvCurrentOdo = metricTextView(currentOdoValueLabel()).apply {
+            textSize = 21f
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, 0, 0, 0)
+        }
+        val trackOdoSavedText = tvCurrentOdo!!
+        if (initialTrackOdo.isNotEmpty()) {
+            trackOdoInput.setText(initialTrackOdo)
+            trackOdoInput.setSelection(trackOdoInput.text.length)
+        }
+        var isTrackOdoEditing = initialTrackOdo.isEmpty()
+        val trackOdoActionButton = secondaryButton("") {}.apply {
+            textSize = 13f
+            minWidth = 0
+            minimumWidth = 0
+            minHeight = 0
+            minimumHeight = 0
+            setPadding(dp(8), 0, dp(8), 0)
+        }
+        val updateTrackOdoMode = {
+            trackOdoInput.visibility = if (isTrackOdoEditing) View.VISIBLE else View.GONE
+            trackOdoSavedText.visibility = if (isTrackOdoEditing) View.GONE else View.VISIBLE
+            trackOdoActionButton.text = if (isTrackOdoEditing) "확인" else "편집"
+        }
+        trackOdoActionButton.setOnClickListener {
+            if (!isTrackOdoEditing) {
+                isTrackOdoEditing = true
+                val savedOdo = currentOdoKmOrNull()?.let(::formatOdoInput)
+                    ?: selectedTrackOdo.ifEmpty { selectedStartOdo }
+                trackOdoInput.setText(savedOdo)
+                trackOdoInput.setSelection(trackOdoInput.text.length)
+                updateTrackOdoMode()
+                trackOdoInput.post {
+                    trackOdoInput.requestFocus()
+                    (getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager)
+                        .showSoftInput(trackOdoInput, InputMethodManager.SHOW_IMPLICIT)
+                }
+                return@setOnClickListener
+            }
+
+            val enteredText = trackOdoInput.text.toString().trim()
+            val service = trackingService
+            if (service == null) {
+                Toast.makeText(
+                    this@MainActivity,
+                    "주행 서비스에 연결 중입니다.",
+                    Toast.LENGTH_SHORT
+                ).show()
+                return@setOnClickListener
+            }
+            val result = service.confirmOdo(enteredText, selectedStartOdo)
+            if (!result.success) {
+                Toast.makeText(
+                    this@MainActivity,
+                    result.message ?: "ODO를 저장할 수 없습니다.",
+                    Toast.LENGTH_SHORT
+                ).show()
+                return@setOnClickListener
+            }
+
+            selectedTrackOdo = enteredText
+            trackOdoSavedText.text = currentOdoValueLabel()
+            isTrackOdoEditing = false
+            trackOdoInput.clearFocus()
+            (getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager)
+                .hideSoftInputFromWindow(trackOdoInput.windowToken, 0)
+            updateTrackOdoMode()
+            updateTrackUi()
+            Toast.makeText(
+                this@MainActivity,
+                result.message ?: "ODO가 저장되었습니다.",
+                Toast.LENGTH_SHORT
+            ).show()
+        }
+
+        val odoCard = cardContainer().apply {
+            orientation = LinearLayout.VERTICAL
+            background = trackSurfaceBackground()
+            setPadding(dp(12), dp(8), dp(12), dp(8))
+            addView(
+                LinearLayout(this@MainActivity).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    addView(
+                        TextView(this@MainActivity).apply {
+                            text = "ODO"
+                            textSize = 13f
+                            setTextColor(ScreenColors.MutedText)
+                        },
+                        LinearLayout.LayoutParams(
+                            0,
+                            ViewGroup.LayoutParams.WRAP_CONTENT,
+                            1f
+                        )
+                    )
+                    addView(
+                        trackOdoActionButton,
+                        LinearLayout.LayoutParams(dp(60), dp(32))
+                    )
+                },
+                LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    dp(34)
+                )
+            )
+            addView(
+                trackOdoInput,
+                LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    dp(44)
+                ).apply {
+                    topMargin = dp(4)
+                }
+            )
+            addView(
+                trackOdoSavedText,
+                LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    dp(44)
+                ).apply {
+                    topMargin = dp(4)
+                }
+            )
+        }
+        updateTrackOdoMode()
+
         tvStatus = metricTextView(currentStatusLabel())
         tvBoundary = metricTextView("고주로: 확인 중")
         tvBrakeLine = metricTextView("브레이크 시작선: 미설정")
@@ -724,9 +876,7 @@ class MainActivity : Activity() {
                 metricCard("속도", tvSpeed!!).apply {
                     background = trackSurfaceBackground()
                 },
-                metricCard("시험 누적거리", tvDistance!!).apply {
-                    background = trackSurfaceBackground()
-                }
+                odoCard
             )
         )
         content.addView(
@@ -756,87 +906,6 @@ class MainActivity : Activity() {
                 addView(tvScenarioInstruction)
             }
         )
-
-        content.addView(sectionTitle("ODO"))
-        content.addView(formLabel("현재 ODO"))
-        val trackOdoInput = numberInput("ODO (km)")
-        val initialTrackOdo = selectedTrackOdo.ifEmpty { selectedStartOdo }
-        tvCurrentOdo = TextView(this).apply {
-            text = currentOdoLabel()
-            textSize = 16f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(ScreenColors.Text)
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(14), 0, dp(14), 0)
-        }
-        val trackOdoSavedText = tvCurrentOdo!!
-        if (initialTrackOdo.isNotEmpty()) {
-            trackOdoInput.setText(initialTrackOdo)
-            trackOdoInput.setSelection(trackOdoInput.text.length)
-        }
-        var isTrackOdoEditing = initialTrackOdo.isEmpty()
-        val trackOdoActionButton = secondaryButton("") {}
-        val updateTrackOdoMode = {
-            trackOdoInput.visibility = if (isTrackOdoEditing) View.VISIBLE else View.GONE
-            trackOdoSavedText.visibility = if (isTrackOdoEditing) View.GONE else View.VISIBLE
-            trackOdoActionButton.text = if (isTrackOdoEditing) "확인" else "편집"
-        }
-        trackOdoActionButton.setOnClickListener {
-            if (!isTrackOdoEditing) {
-                isTrackOdoEditing = true
-                val savedOdo = currentOdoKmOrNull()?.let(::formatOdoInput)
-                    ?: selectedTrackOdo.ifEmpty { selectedStartOdo }
-                trackOdoInput.setText(savedOdo)
-                trackOdoInput.setSelection(trackOdoInput.text.length)
-                updateTrackOdoMode()
-                trackOdoInput.post {
-                    trackOdoInput.requestFocus()
-                    (getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager)
-                        .showSoftInput(trackOdoInput, InputMethodManager.SHOW_IMPLICIT)
-                }
-                return@setOnClickListener
-            }
-
-            val enteredText = trackOdoInput.text.toString().trim()
-            val service = trackingService
-            if (service == null) {
-                Toast.makeText(this@MainActivity, "주행 서비스에 연결 중입니다.", Toast.LENGTH_SHORT).show()
-                return@setOnClickListener
-            }
-            val result = service.confirmOdo(enteredText, selectedStartOdo)
-            if (!result.success) {
-                Toast.makeText(
-                    this@MainActivity,
-                    result.message ?: "ODO를 저장할 수 없습니다.",
-                    Toast.LENGTH_SHORT
-                ).show()
-                return@setOnClickListener
-            }
-
-            selectedTrackOdo = enteredText
-            trackOdoSavedText.text = currentOdoLabel()
-            isTrackOdoEditing = false
-            trackOdoInput.clearFocus()
-            (getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager)
-                .hideSoftInputFromWindow(trackOdoInput.windowToken, 0)
-            updateTrackOdoMode()
-            updateTrackUi()
-            Toast.makeText(
-                this@MainActivity,
-                result.message ?: "ODO가 저장되었습니다.",
-                Toast.LENGTH_SHORT
-            ).show()
-        }
-        val trackOdoRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            addView(trackOdoInput, LinearLayout.LayoutParams(0, dp(52), 1f).apply { rightMargin = dp(8) })
-            addView(trackOdoSavedText, LinearLayout.LayoutParams(0, dp(52), 1f).apply { rightMargin = dp(8) })
-            addView(trackOdoActionButton, LinearLayout.LayoutParams(dp(112), dp(52)))
-        }
-        updateTrackOdoMode()
-        content.addView(trackOdoRow)
-        content.addView(space(dp(10)))
 
         btnSetBrakeLine = secondaryButton("시작선 수동 설정") {
             setBrakeLine()
@@ -908,13 +977,19 @@ class MainActivity : Activity() {
         )
         root.addView(body, weightedContent())
         container.addView(root, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
-        redFlashOverlay = View(this).apply {
+        alertFlashOverlay = View(this).apply {
             setBackgroundColor(Color.argb(170, 220, 38, 38))
             alpha = 0f
             visibility = View.GONE
             isClickable = false
         }
-        container.addView(redFlashOverlay, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        container.addView(
+            alertFlashOverlay,
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT
+            )
+        )
         return container
     }
 
@@ -1125,7 +1200,7 @@ class MainActivity : Activity() {
 
     private fun updateTrackUi() {
         if (sessionState != SessionState.Running) {
-            stopRedFlashLoop()
+            stopAlertFlashLoop()
         }
 
         val location = currentLocation
@@ -1138,8 +1213,7 @@ class MainActivity : Activity() {
             latestTrackingSnapshot?.scenarioStep ?: currentScenarioStep()
 
         tvSpeed?.text = String.format(Locale.US, "%.1f km/h", currentSpeedKmh)
-        tvDistance?.text = String.format(Locale.US, "%.2f km", progressDistanceKm)
-        tvCurrentOdo?.text = currentOdoLabel()
+        tvCurrentOdo?.text = currentOdoValueLabel()
         tvStatus?.text = currentStatusLabel()
         tvBoundary?.text = trackAreaLabel()
         tvBrakeLine?.text = brakeLineStatusLabel(scenarioStep)
@@ -1164,11 +1238,16 @@ class MainActivity : Activity() {
             )
             tvScenarioTarget?.text = "규정속도 ${scenarioStep.targetSpeedKmh}km/h"
         }
-        tvScenarioInstruction?.text = scenarioInstruction(scenarioStep)
+        tvScenarioInstruction?.text = speedGuidance
+            ?.let(TargetSpeedGuidanceRules::displayMessage)
+            ?: scenarioInstruction(scenarioStep)
         tvScenarioInstruction?.setTextColor(
-            when (drivingActionState) {
-                DrivingActionState.DECELERATING -> Color.rgb(185, 28, 28)
-                DrivingActionState.ACCELERATING -> ScreenColors.Primary
+            when {
+                speedGuidance != null -> Color.rgb(194, 65, 12)
+                drivingActionState == DrivingActionState.DECELERATING ->
+                    Color.rgb(185, 28, 28)
+                drivingActionState == DrivingActionState.ACCELERATING ->
+                    ScreenColors.Primary
                 else -> ScreenColors.Text
             }
         )
@@ -1211,9 +1290,9 @@ class MainActivity : Activity() {
         )
     }
 
-    private fun currentOdoLabel(): String {
-        val currentOdo = currentOdoKmOrNull() ?: return "현재 ODO: 미입력"
-        return String.format(Locale.US, "현재 ODO: %.2f km", currentOdo)
+    private fun currentOdoValueLabel(): String {
+        val currentOdo = currentOdoKmOrNull() ?: return "미입력"
+        return String.format(Locale.US, "%.2f km", currentOdo)
     }
 
     private fun formatOdoInput(odoKm: Double): String {
@@ -1366,8 +1445,8 @@ class MainActivity : Activity() {
 
     private fun metricRow(left: View, right: View): LinearLayout = LinearLayout(this).apply {
         orientation = LinearLayout.HORIZONTAL
-        addView(left, LinearLayout.LayoutParams(0, dp(92), 1f).apply { rightMargin = dp(6) })
-        addView(right, LinearLayout.LayoutParams(0, dp(92), 1f).apply { leftMargin = dp(6) })
+        addView(left, LinearLayout.LayoutParams(0, dp(104), 1f).apply { rightMargin = dp(6) })
+        addView(right, LinearLayout.LayoutParams(0, dp(104), 1f).apply { leftMargin = dp(6) })
     }
 
     private fun numberInput(hintText: String): EditText = EditText(this).apply {

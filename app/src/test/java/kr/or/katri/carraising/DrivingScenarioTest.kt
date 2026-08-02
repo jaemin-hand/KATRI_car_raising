@@ -89,15 +89,26 @@ class DrivingScenarioTest {
     }
 
     @Test
-    fun hybridRestartsFromAAfterThreeThousandKm() {
-        val restartedA = KatriDrivingScenario.stepAt(3_000.0, PowertrainType.HYBRID)!!
-        assertEquals("A-1", restartedA.id)
-        assertEquals(60, restartedA.targetSpeedKmh)
-        assertEquals(3_100.0, restartedA.endKm, 0.0)
+    fun hybridRepeatsFullThreeThousandKilometerScenarioBlocks() {
+        val firstRepeatedA = KatriDrivingScenario.stepAt(3_000.0, PowertrainType.HYBRID)!!
+        assertEquals("A-1", firstRepeatedA.id)
+        assertEquals(60, firstRepeatedA.targetSpeedKmh)
+        assertEquals(3_100.0, firstRepeatedA.endKm, 0.0)
 
-        val secondCycleA = KatriDrivingScenario.stepAt(5_000.0, PowertrainType.HYBRID)!!
-        assertEquals("A-1", secondCycleA.id)
-        assertEquals(5_100.0, secondCycleA.endKm, 0.0)
+        val firstRepeatedWot = KatriDrivingScenario.stepAt(5_150.0, PowertrainType.HYBRID)!!
+        assertEquals("H-R1-2", firstRepeatedWot.id)
+        assertEquals(145, firstRepeatedWot.targetSpeedKmh)
+        assertEquals(110, firstRepeatedWot.decelTargetKmh)
+        assertEquals(AccelerationMethod.WOT, firstRepeatedWot.accelerationMethod)
+
+        val secondRepeatedA = KatriDrivingScenario.stepAt(6_000.0, PowertrainType.HYBRID)!!
+        assertEquals("A-1", secondRepeatedA.id)
+        assertEquals(60, secondRepeatedA.targetSpeedKmh)
+        assertEquals(6_100.0, secondRepeatedA.endKm, 0.0)
+
+        val secondRepeatedWot = KatriDrivingScenario.stepAt(8_950.0, PowertrainType.HYBRID)!!
+        assertEquals("H-R5-2", secondRepeatedWot.id)
+        assertEquals(AccelerationMethod.WOT, secondRepeatedWot.accelerationMethod)
     }
 
     @Test

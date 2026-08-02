@@ -94,7 +94,7 @@ object KatriDrivingScenario {
 
         return when (powertrainType) {
             PowertrainType.COMBUSTION -> repeatedHStep(distanceKm)
-            PowertrainType.HYBRID -> repeatedBaseStep(distanceKm)
+            PowertrainType.HYBRID -> repeatedCommonStep(distanceKm)
             PowertrainType.ELECTRIC -> repeatedHStep(distanceKm)
         }
     }
@@ -130,15 +130,19 @@ object KatriDrivingScenario {
         }
     }
 
-    private fun repeatedBaseStep(distanceKm: Double): DrivingScenarioStep {
-        val cycleIndex = ((distanceKm - 3_000.0) / 2_000.0).toInt()
-        val cycleStartKm = 3_000.0 + cycleIndex * 2_000.0
+    private fun repeatedCommonStep(distanceKm: Double): DrivingScenarioStep {
+        val cycleIndex = ((distanceKm - commonConfiguredEndKm) / commonConfiguredEndKm).toInt()
+        val cycleStartKm = commonConfiguredEndKm * (cycleIndex + 1)
         val localDistanceKm = distanceKm - cycleStartKm
-        val baseStep = baseSteps.first { it.contains(localDistanceKm) }
-        return baseStep.copy(
-            section = "${baseStep.section} 반복",
-            startKm = cycleStartKm + baseStep.startKm,
-            endKm = cycleStartKm + baseStep.endKm
+        val commonStep = commonSteps.first { it.contains(localDistanceKm) }
+        return commonStep.copy(
+            section = if (commonStep.section.endsWith(" 반복")) {
+                commonStep.section
+            } else {
+                "${commonStep.section} 반복"
+            },
+            startKm = cycleStartKm + commonStep.startKm,
+            endKm = cycleStartKm + commonStep.endKm
         )
     }
 

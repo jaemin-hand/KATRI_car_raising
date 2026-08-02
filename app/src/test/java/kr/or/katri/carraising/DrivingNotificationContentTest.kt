@@ -57,4 +57,29 @@ class DrivingNotificationContentTest {
             DrivingNotificationContent.scenarioTransition(step)
         )
     }
+
+    @Test
+    fun speedGuidanceOverridesNormalCruiseInstruction() {
+        val step = KatriDrivingScenario.stepAt(1_250.0, PowertrainType.COMBUSTION)!!
+        val guidance = TargetSpeedGuidanceRules.evaluate(
+            targetSpeedKmh = 130,
+            currentSpeedKmh = 133.2,
+            toleranceKmh = 3.0
+        )
+
+        val status = DrivingNotificationContent.status(
+            sessionState = SessionState.Running,
+            speedKmh = 133.2,
+            progressDistanceKm = 1_250.0,
+            step = step,
+            actionState = DrivingActionState.CRUISING,
+            speedGuidance = guidance
+        )
+
+        assertTrue(
+            status.expandedLines.contains(
+                "주행 지시: 규정속도 이탈 · 속도를 3.2km/h 내리세요"
+            )
+        )
+    }
 }

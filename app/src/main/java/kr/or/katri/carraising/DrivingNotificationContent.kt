@@ -14,12 +14,15 @@ internal object DrivingNotificationContent {
         speedKmh: Double,
         progressDistanceKm: Double,
         step: DrivingScenarioStep?,
-        actionState: DrivingActionState
+        actionState: DrivingActionState,
+        speedGuidance: SpeedGuidance? = null
     ): DrivingNotificationStatus {
         val targetSpeed = step?.let { "${it.targetSpeedKmh}km/h" } ?: "-"
         val stepLabel = step?.let { "${it.id} · ${it.driveMode.label}" } ?: "시나리오 없음"
         val instruction = if (sessionState == SessionState.Paused) {
             "주행 일시정지"
+        } else if (speedGuidance != null) {
+            TargetSpeedGuidanceRules.displayMessage(speedGuidance)
         } else {
             instruction(step, actionState)
         }

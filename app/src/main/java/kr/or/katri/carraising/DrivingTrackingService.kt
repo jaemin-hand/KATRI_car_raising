@@ -71,6 +71,8 @@ class DrivingTrackingService : Service() {
     private var brakeLineLocation: Location? = null
     private var activeScenarioStepId: String? = null
     private var drivingActionState = DrivingActionState.CRUISING
+    private val speedGuidanceMonitor = TargetSpeedMonitor(SPEED_TARGET_TOLERANCE_KMH)
+    private val brakeApproachMonitor = BrakeApproachMonitor()
     private var odoConfirmedAtSessionDistanceM = 0.0
 
     private val currentRoutePoints = ArrayList<GeoPoint>()
@@ -82,11 +84,20 @@ class DrivingTrackingService : Service() {
 
     private var alarmTone: ToneGenerator? = null
     private var textToSpeech: TextToSpeech? = null
+    private var isTextToSpeechInitializationComplete = false
     private var isTextToSpeechReady = false
+    private var activeApproachGuidance: BrakeApproachGuidance? = null
+    private var isApproachGuidanceVoiceActive = false
+    private var isApproachToneSequenceActive = false
+    private var approachGuidanceVoiceUtteranceSequence = 0L
+    private var currentApproachGuidanceVoiceUtteranceId: String? = null
     private var isBrakeVoiceActive = false
     private var brakeVoiceTargetKmh: Int? = null
     private var brakeVoiceUtteranceSequence = 0L
     private var currentBrakeVoiceUtteranceId: String? = null
+    private var isSpeedGuidanceVoiceActive = false
+    private var speedGuidanceVoiceUtteranceSequence = 0L
+    private var currentSpeedGuidanceVoiceUtteranceId: String? = null
 
     private val locationListener = object : LocationListener {
         override fun onLocationChanged(location: Location) {
@@ -110,10 +121,12 @@ class DrivingTrackingService : Service() {
             val hasStaleLocation =
                 previousLocationUpdateMs > 0L &&
                     nowMs - previousLocationUpdateMs > STALE_SPEED_TIMEOUT_MS
+            var shouldNotifyListeners = false
+            val previousSpeedGuidance = speedGuidanceMonitor.guidance
             if (hasStaleLocation) {
                 if (currentSpeedKmh != 0.0) {
                     currentSpeedKmh = 0.0
-                    notifyListeners()
+                    shouldNotifyListeners = true
                 }
                 if (sessionState == SessionState.Running && !isGpsSignalStale) {
                     isGpsSignalStale = true
@@ -134,6 +147,11 @@ class DrivingTrackingService : Service() {
             } else {
                 isGpsSignalStale = false
             }
+            updateSpeedGuidanceState()
+            if (speedGuidanceMonitor.guidance != previousSpeedGuidance) {
+                shouldNotifyListeners = true
+            }
+            if (shouldNotifyListeners) notifyListeners()
             updateForegroundNotification()
             if (hasBoundClient || isLocationListening || isSessionActive()) {
                 mainHandler.postDelayed(this, STATUS_REFRESH_INTERVAL_MS)
@@ -143,6 +161,30 @@ class DrivingTrackingService : Service() {
 
     private val brakeVoiceRepeatRunnable = Runnable {
         speakBrakeInstructionIfNeeded()
+    }
+
+    private val speedGuidanceVoiceRepeatRunnable = Runnable {
+        speakSpeedGuidanceIfNeeded()
+    }
+
+    private val approachGuidanceVoiceRunnable = Runnable {
+        isApproachToneSequenceActive = false
+        speakApproachGuidanceIfNeeded()
+    }
+
+    private val approachGuidanceSecondToneRunnable = Runnable {
+        val guidance = activeApproachGuidance
+        if (
+            !isApproachGuidanceVoiceActive ||
+            guidance?.playsPreparationTone != true
+        ) {
+            return@Runnable
+        }
+        playPreparationAlertTone()
+        mainHandler.postDelayed(
+            approachGuidanceVoiceRunnable,
+            APPROACH_TONE_TO_VOICE_DELAY_MS
+        )
     }
 
     override fun onCreate() {
@@ -193,7 +235,9 @@ class DrivingTrackingService : Service() {
     override fun onDestroy() {
         persistSessionState(force = true)
         stopLocationUpdates()
+        stopApproachGuidanceVoice()
         stopBrakeVoicePrompt()
+        stopSpeedGuidanceVoice()
         textToSpeech?.shutdown()
         textToSpeech = null
         alarmTone?.release()
@@ -231,6 +275,7 @@ class DrivingTrackingService : Service() {
             brakeLineLocation = brakeLineLocation?.let { GeoPoint(it.latitude, it.longitude) },
             activeScenarioStepId = activeScenarioStepId,
             drivingActionState = drivingActionState,
+            speedGuidance = speedGuidanceMonitor.guidance,
             currentRoutePoints = currentRoutePoints.toList(),
             referenceRoutePoints = referenceRoutePoints.toList(),
             hasReferenceRoute = hasReferenceRoute,
@@ -254,6 +299,7 @@ class DrivingTrackingService : Service() {
         selectedPowertrain = powertrain
         selectedStartOdo = startOdo
         selectedTrackOdo = trackOdo
+        brakeApproachMonitor.reset()
         syncScenarioState()
         persistSessionState(force = true)
         notifyListeners()
@@ -294,6 +340,8 @@ class DrivingTrackingService : Service() {
         brakeLineLocation = null
         lastGateDistanceM = totalDistanceM
         wasInBrakeLineGate = false
+        brakeApproachMonitor.reset()
+        stopApproachGuidanceVoice()
         if (sessionState == SessionState.Ready) {
             sessionState = SessionState.Idle
         }
@@ -331,7 +379,9 @@ class DrivingTrackingService : Service() {
         if (sessionState != SessionState.Running) return
         sessionState = SessionState.Paused
         currentSpeedKmh = 0.0
+        stopApproachGuidanceVoice()
         stopBrakeVoicePrompt()
+        clearSpeedGuidance(resetArming = true)
         persistSessionState(force = true)
         notifyListeners()
         updateForegroundNotification(force = true)
@@ -343,6 +393,7 @@ class DrivingTrackingService : Service() {
         previousLocationUpdateMs = SystemClock.elapsedRealtime()
         syncScenarioState()
         resumeBrakeVoiceIfNeeded()
+        updateSpeedGuidanceState()
         persistSessionState(force = true)
         notifyListeners()
         updateForegroundNotification(force = true)
@@ -353,7 +404,10 @@ class DrivingTrackingService : Service() {
         sessionState = SessionState.Finished
         currentSpeedKmh = 0.0
         latestRawSpeedKmh = null
+        stopApproachGuidanceVoice()
+        brakeApproachMonitor.reset()
         stopBrakeVoicePrompt()
+        clearSpeedGuidance(resetArming = true)
         persistSessionState(force = true)
         notifyListeners()
         leaveForeground()
@@ -372,9 +426,12 @@ class DrivingTrackingService : Service() {
         odoConfirmedAtSessionDistanceM = 0.0
         activeScenarioStepId = null
         drivingActionState = DrivingActionState.CRUISING
+        brakeApproachMonitor.reset()
         currentRoutePoints.clear()
         sessionState = SessionState.Ready
+        stopApproachGuidanceVoice()
         stopBrakeVoicePrompt()
+        clearSpeedGuidance(resetArming = true)
         persistSessionState(force = true)
         notifyListeners()
     }
@@ -429,6 +486,9 @@ class DrivingTrackingService : Service() {
         odoConfirmedAtSessionDistanceM = 0.0
         activeScenarioStepId = null
         drivingActionState = DrivingActionState.CRUISING
+        brakeApproachMonitor.reset()
+        stopApproachGuidanceVoice()
+        clearSpeedGuidance(resetArming = true)
         currentRoutePoints.clear()
         appendCurrentRoutePoint(now, force = true)
         wasInBrakeLineGate = isInBrakeLineGate(now)
@@ -444,6 +504,9 @@ class DrivingTrackingService : Service() {
     private fun failSessionStart(message: String) {
         publishNotice(message)
         sessionState = if (brakeLineLocation == null) SessionState.Idle else SessionState.Ready
+        brakeApproachMonitor.reset()
+        stopApproachGuidanceVoice()
+        clearSpeedGuidance(resetArming = true)
         persistSessionState(force = true)
         notifyListeners()
         leaveForeground()
@@ -587,9 +650,13 @@ class DrivingTrackingService : Service() {
         if (brakeLineLocation != null && sessionState != SessionState.Idle) {
             updateTrackAreaState(location)
         }
-        if (sessionState != SessionState.Running) {
+        if (sessionState == SessionState.Running) {
+            updateBrakeApproachGuidance(location)
+        } else {
+            stopApproachGuidanceVoice()
             stopBrakeVoicePrompt()
         }
+        updateSpeedGuidanceState()
 
         persistSessionState()
         notifyListeners()
@@ -681,18 +748,51 @@ class DrivingTrackingService : Service() {
             location.speedAccuracyMetersPerSecond <= MAX_SPEED_ACCURACY_MPS
     }
 
+    private fun updateBrakeApproachGuidance(location: Location) {
+        val brakeLine = brakeLineLocation ?: return
+        val step = currentScenarioStep() ?: return
+        val remainingRouteDistanceM = if (
+            hasReferenceRoute &&
+            referenceRoutePoints.size >= REFERENCE_ROUTE_MIN_POINTS
+        ) {
+            BrakeApproachGuidanceRules.remainingRouteDistanceM(
+                route = referenceRoutePoints,
+                currentLocation = GeoPoint(location.latitude, location.longitude),
+                brakeLineLocation = GeoPoint(brakeLine.latitude, brakeLine.longitude)
+            )
+        } else {
+            null
+        }
+        val guidance = brakeApproachMonitor.update(
+            sessionState = sessionState,
+            step = step,
+            actionState = drivingActionState,
+            currentSpeedKmh = currentSpeedKmh,
+            hasValidSpeedSample = latestRawSpeedKmh != null,
+            isGpsSignalStale = isGpsSignalStale,
+            traveledSinceBrakeLineM = max(0.0, totalDistanceM - lastGateDistanceM),
+            remainingRouteDistanceM = remainingRouteDistanceM,
+            straightLineDistanceM = location.distanceTo(brakeLine).toDouble()
+        ) ?: return
+
+        startApproachGuidanceVoice(guidance)
+    }
+
     private fun evaluateLap(location: Location) {
         val inGate = isInBrakeLineGate(location)
         val traveledFromLastGate = totalDistanceM - lastGateDistanceM
         if (!wasInBrakeLineGate && inGate && traveledFromLastGate >= GPS_GATE_MIN_DISTANCE_M) {
             lastGateDistanceM = totalDistanceM
             wasInBrakeLineGate = true
+            brakeApproachMonitor.resetForNextLap()
+            stopApproachGuidanceVoice()
             saveReferenceRouteIfReady()
             startNewLapRoute(location)
 
             val step = currentScenarioStep()
             if (step?.driveMode == ScenarioDriveMode.ACCEL_DECEL) {
                 drivingActionState = DrivingActionState.DECELERATING
+                clearSpeedGuidance(resetArming = false)
                 showDrivingAlert(
                     title = "브레이크 시작 · ${step.id}",
                     message = DrivingNotificationContent.brakeAlert(step)
@@ -877,6 +977,8 @@ class DrivingTrackingService : Service() {
         saveBrakeLine()
         lastGateDistanceM = totalDistanceM
         wasInBrakeLineGate = true
+        brakeApproachMonitor.resetForNextLap()
+        stopApproachGuidanceVoice()
         stopBrakeVoicePrompt()
 
         if (activeSession) {
@@ -1025,7 +1127,10 @@ class DrivingTrackingService : Service() {
             ScenarioDriveMode.ACCEL_DECEL -> DrivingActionState.WAITING_FOR_BRAKE_LINE
             else -> DrivingActionState.CRUISING
         }
+        brakeApproachMonitor.cancelCandidate()
+        stopApproachGuidanceVoice()
         stopBrakeVoicePrompt()
+        clearSpeedGuidance(resetArming = false)
 
         if (sessionState == SessionState.Running && previousStepId != null) {
             if (step == null) {
@@ -1074,12 +1179,43 @@ class DrivingTrackingService : Service() {
             displayedSpeedKmh = currentSpeedKmh,
             latestRawSpeedKmh = latestRawSpeedKmh,
             toleranceKmh = DECELERATION_TARGET_TOLERANCE_KMH,
+            completeStopResidualSpeedKmh = COMPLETE_STOP_MAX_RESIDUAL_SPEED_KMH,
             hasStationaryEvidence = hasStationaryEvidenceForControl
         )
     }
 
+    private fun updateSpeedGuidanceState() {
+        val previousGuidance = speedGuidanceMonitor.guidance
+        val nextGuidance = speedGuidanceMonitor.update(
+            sessionState = sessionState,
+            step = currentScenarioStep(),
+            actionState = drivingActionState,
+            currentSpeedKmh = currentSpeedKmh,
+            hasValidSpeedSample = latestRawSpeedKmh != null,
+            isGpsSignalStale = isGpsSignalStale
+        )
+
+        when {
+            nextGuidance == null -> stopSpeedGuidanceVoice()
+            previousGuidance == null ||
+                previousGuidance.direction != nextGuidance.direction ->
+                startSpeedGuidanceVoice()
+            !isSpeedGuidanceVoiceActive -> startSpeedGuidanceVoice()
+        }
+    }
+
+    private fun clearSpeedGuidance(resetArming: Boolean) {
+        if (resetArming) {
+            speedGuidanceMonitor.reset()
+        } else {
+            speedGuidanceMonitor.suspendGuidance()
+        }
+        stopSpeedGuidanceVoice()
+    }
+
     private fun initTextToSpeech() {
         textToSpeech = TextToSpeech(this) { status ->
+            isTextToSpeechInitializationComplete = true
             val engine = textToSpeech
             if (status == TextToSpeech.SUCCESS && engine != null) {
                 val languageResult = engine.setLanguage(Locale.KOREAN)
@@ -1098,22 +1234,135 @@ class DrivingTrackingService : Service() {
                         override fun onStart(utteranceId: String?) = Unit
 
                         override fun onDone(utteranceId: String?) {
+                            onApproachGuidanceUtteranceFinished(utteranceId)
                             onBrakeVoiceUtteranceFinished(utteranceId, failed = false)
+                            onSpeedGuidanceUtteranceFinished(utteranceId, failed = false)
                         }
 
                         @Deprecated("Deprecated in Android")
                         override fun onError(utteranceId: String?) {
+                            onApproachGuidanceUtteranceFinished(utteranceId)
                             onBrakeVoiceUtteranceFinished(utteranceId, failed = true)
+                            onSpeedGuidanceUtteranceFinished(utteranceId, failed = true)
                         }
                     })
                 }
             }
-            mainHandler.post { resumeBrakeVoiceIfNeeded() }
+            mainHandler.post {
+                resumeBrakeVoiceIfNeeded()
+                resumeApproachGuidanceVoiceIfNeeded()
+                resumeSpeedGuidanceVoiceIfNeeded()
+            }
         }
+    }
+
+    private fun startApproachGuidanceVoice(guidance: BrakeApproachGuidance) {
+        stopSpeedGuidanceVoice()
+        stopApproachGuidanceVoice()
+        activeApproachGuidance = guidance
+        isApproachGuidanceVoiceActive = true
+
+        if (guidance.playsPreparationTone) {
+            isApproachToneSequenceActive = true
+            playPreparationAlertTone()
+            mainHandler.postDelayed(
+                approachGuidanceSecondToneRunnable,
+                APPROACH_TONE_INTERVAL_MS
+            )
+        } else {
+            speakApproachGuidanceIfNeeded()
+        }
+    }
+
+    private fun resumeApproachGuidanceVoiceIfNeeded() {
+        if (
+            !isApproachGuidanceVoiceActive ||
+            isBrakeVoiceActive ||
+            sessionState != SessionState.Running ||
+            isApproachToneSequenceActive ||
+            currentApproachGuidanceVoiceUtteranceId != null
+        ) {
+            return
+        }
+        speakApproachGuidanceIfNeeded()
+    }
+
+    private fun stopApproachGuidanceVoice() {
+        mainHandler.removeCallbacks(approachGuidanceVoiceRunnable)
+        mainHandler.removeCallbacks(approachGuidanceSecondToneRunnable)
+        val hadActivePrompt =
+            isApproachGuidanceVoiceActive ||
+                currentApproachGuidanceVoiceUtteranceId != null
+        activeApproachGuidance = null
+        isApproachGuidanceVoiceActive = false
+        isApproachToneSequenceActive = false
+        currentApproachGuidanceVoiceUtteranceId = null
+        if (hadActivePrompt && !isBrakeVoiceActive && !isSpeedGuidanceVoiceActive) {
+            textToSpeech?.stop()
+        }
+    }
+
+    private fun speakApproachGuidanceIfNeeded() {
+        val guidance = activeApproachGuidance
+        if (
+            !isApproachGuidanceVoiceActive ||
+            isBrakeVoiceActive ||
+            sessionState != SessionState.Running ||
+            guidance == null
+        ) {
+            stopApproachGuidanceVoice()
+            return
+        }
+        if (!isTextToSpeechInitializationComplete) return
+
+        val engine = textToSpeech
+        if (!isTextToSpeechReady || engine == null) {
+            completeApproachGuidanceVoice()
+            return
+        }
+
+        approachGuidanceVoiceUtteranceSequence += 1L
+        val utteranceId =
+            "approach-guidance-$approachGuidanceVoiceUtteranceSequence"
+        currentApproachGuidanceVoiceUtteranceId = utteranceId
+        val result = engine.speak(
+            guidance.message,
+            TextToSpeech.QUEUE_FLUSH,
+            null,
+            utteranceId
+        )
+        if (result == TextToSpeech.ERROR) {
+            currentApproachGuidanceVoiceUtteranceId = null
+            completeApproachGuidanceVoice()
+        }
+    }
+
+    private fun onApproachGuidanceUtteranceFinished(utteranceId: String?) {
+        mainHandler.post {
+            if (
+                !isApproachGuidanceVoiceActive ||
+                utteranceId != currentApproachGuidanceVoiceUtteranceId
+            ) {
+                return@post
+            }
+            completeApproachGuidanceVoice()
+        }
+    }
+
+    private fun completeApproachGuidanceVoice() {
+        mainHandler.removeCallbacks(approachGuidanceVoiceRunnable)
+        mainHandler.removeCallbacks(approachGuidanceSecondToneRunnable)
+        activeApproachGuidance = null
+        isApproachGuidanceVoiceActive = false
+        isApproachToneSequenceActive = false
+        currentApproachGuidanceVoiceUtteranceId = null
+        resumeSpeedGuidanceVoiceIfNeeded()
     }
 
     private fun startBrakeVoicePrompt(step: DrivingScenarioStep) {
         val targetKmh = step.decelTargetKmh ?: return
+        stopApproachGuidanceVoice()
+        clearSpeedGuidance(resetArming = false)
         stopBrakeVoicePrompt()
         brakeVoiceTargetKmh = targetKmh
         isBrakeVoiceActive = true
@@ -1188,6 +1437,110 @@ class DrivingTrackingService : Service() {
         }
     }
 
+    private fun startSpeedGuidanceVoice() {
+        if (
+            isBrakeVoiceActive ||
+            isApproachGuidanceVoiceActive ||
+            speedGuidanceMonitor.guidance == null
+        ) {
+            return
+        }
+        stopSpeedGuidanceVoice()
+        isSpeedGuidanceVoiceActive = true
+        speakSpeedGuidanceIfNeeded()
+    }
+
+    private fun resumeSpeedGuidanceVoiceIfNeeded() {
+        if (
+            isBrakeVoiceActive ||
+            isApproachGuidanceVoiceActive ||
+            sessionState != SessionState.Running ||
+            speedGuidanceMonitor.guidance == null
+        ) return
+        if (!isSpeedGuidanceVoiceActive) {
+            isSpeedGuidanceVoiceActive = true
+        }
+        speakSpeedGuidanceIfNeeded()
+    }
+
+    private fun stopSpeedGuidanceVoice() {
+        mainHandler.removeCallbacks(speedGuidanceVoiceRepeatRunnable)
+        if (
+            !isSpeedGuidanceVoiceActive &&
+            currentSpeedGuidanceVoiceUtteranceId == null
+        ) return
+        val hadActivePrompt =
+            isSpeedGuidanceVoiceActive || currentSpeedGuidanceVoiceUtteranceId != null
+        isSpeedGuidanceVoiceActive = false
+        currentSpeedGuidanceVoiceUtteranceId = null
+        if (
+            hadActivePrompt &&
+            !isBrakeVoiceActive &&
+            !isApproachGuidanceVoiceActive
+        ) {
+            textToSpeech?.stop()
+        }
+    }
+
+    private fun speakSpeedGuidanceIfNeeded() {
+        mainHandler.removeCallbacks(speedGuidanceVoiceRepeatRunnable)
+        val guidance = speedGuidanceMonitor.guidance
+        if (
+            !isSpeedGuidanceVoiceActive ||
+            isBrakeVoiceActive ||
+            isApproachGuidanceVoiceActive ||
+            sessionState != SessionState.Running ||
+            guidance == null
+        ) {
+            stopSpeedGuidanceVoice()
+            return
+        }
+
+        val engine = textToSpeech
+        if (!isTextToSpeechReady || engine == null) {
+            playFallbackAlarmTone()
+            mainHandler.postDelayed(
+                speedGuidanceVoiceRepeatRunnable,
+                SPEED_GUIDANCE_VOICE_REPEAT_DELAY_MS
+            )
+            return
+        }
+
+        speedGuidanceVoiceUtteranceSequence += 1L
+        val utteranceId = "speed-guidance-$speedGuidanceVoiceUtteranceSequence"
+        currentSpeedGuidanceVoiceUtteranceId = utteranceId
+        val result = engine.speak(
+            TargetSpeedGuidanceRules.voiceMessage(guidance),
+            TextToSpeech.QUEUE_FLUSH,
+            null,
+            utteranceId
+        )
+        if (result == TextToSpeech.ERROR) {
+            currentSpeedGuidanceVoiceUtteranceId = null
+            playFallbackAlarmTone()
+            mainHandler.postDelayed(
+                speedGuidanceVoiceRepeatRunnable,
+                SPEED_GUIDANCE_VOICE_REPEAT_DELAY_MS
+            )
+        }
+    }
+
+    private fun onSpeedGuidanceUtteranceFinished(utteranceId: String?, failed: Boolean) {
+        mainHandler.post {
+            if (
+                !isSpeedGuidanceVoiceActive ||
+                utteranceId != currentSpeedGuidanceVoiceUtteranceId
+            ) return@post
+            currentSpeedGuidanceVoiceUtteranceId = null
+            if (failed) playFallbackAlarmTone()
+            mainHandler.removeCallbacks(speedGuidanceVoiceRepeatRunnable)
+            mainHandler.postDelayed(
+                speedGuidanceVoiceRepeatRunnable,
+                SPEED_GUIDANCE_VOICE_REPEAT_DELAY_MS
+            )
+        }
+    }
+
     private fun brakeVoiceMessage(targetKmh: Int): String {
         return if (targetKmh <= 0) {
             "완전 정차하세요."
@@ -1201,6 +1554,13 @@ class DrivingTrackingService : Service() {
             alarmTone = ToneGenerator(AudioManager.STREAM_ALARM, 100)
         }
         alarmTone?.startTone(ToneGenerator.TONE_PROP_BEEP, 500)
+    }
+
+    private fun playPreparationAlertTone() {
+        if (alarmTone == null) {
+            alarmTone = ToneGenerator(AudioManager.STREAM_ALARM, 100)
+        }
+        alarmTone?.startTone(ToneGenerator.TONE_PROP_ACK, APPROACH_TONE_DURATION_MS)
     }
 
     private fun createNotificationChannel() {
@@ -1349,7 +1709,8 @@ class DrivingTrackingService : Service() {
             speedKmh = currentSpeedKmh,
             progressDistanceKm = testProgressDistanceKm(),
             step = scenario,
-            actionState = drivingActionState
+            actionState = drivingActionState,
+            speedGuidance = speedGuidanceMonitor.guidance
         )
         val expandedStyle = Notification.InboxStyle()
             .setBigContentTitle(title)
@@ -1426,9 +1787,19 @@ class DrivingTrackingService : Service() {
         drivingActionState = preferences.getString(KEY_DRIVING_ACTION_STATE, null)
             ?.let { runCatching { DrivingActionState.valueOf(it) }.getOrNull() }
             ?: DrivingActionState.CRUISING
+        speedGuidanceMonitor.restoreArmedTargetSpeed(
+            preferences.getString(KEY_SPEED_GUIDANCE_ARMED_TARGET_KMH, null)?.toIntOrNull()
+        )
+        brakeApproachMonitor.restoreAnnouncedStepId(
+            preferences.getString(KEY_BRAKE_APPROACH_ANNOUNCED_STEP_ID, null)
+        )
 
         if (isSessionActive() && selectedPowertrain == null) {
             sessionState = if (brakeLineLocation == null) SessionState.Idle else SessionState.Ready
+        }
+        if (!isSessionActive()) {
+            speedGuidanceMonitor.reset()
+            brakeApproachMonitor.reset()
         }
         currentSpeedKmh = 0.0
         latestRawSpeedKmh = null
@@ -1449,6 +1820,14 @@ class DrivingTrackingService : Service() {
             .putString(KEY_ODO_CONFIRMATION_DISTANCE_M, odoConfirmedAtSessionDistanceM.toString())
             .putString(KEY_ACTIVE_SCENARIO_STEP_ID, activeScenarioStepId)
             .putString(KEY_DRIVING_ACTION_STATE, drivingActionState.name)
+            .putString(
+                KEY_SPEED_GUIDANCE_ARMED_TARGET_KMH,
+                speedGuidanceMonitor.armedTargetSpeedKmh?.toString()
+            )
+            .putString(
+                KEY_BRAKE_APPROACH_ANNOUNCED_STEP_ID,
+                brakeApproachMonitor.announcedStepId
+            )
             .apply()
     }
 
@@ -1492,6 +1871,10 @@ class DrivingTrackingService : Service() {
             "tracking_odo_confirmation_distance_m"
         private const val KEY_ACTIVE_SCENARIO_STEP_ID = "tracking_active_scenario_step_id"
         private const val KEY_DRIVING_ACTION_STATE = "tracking_driving_action_state"
+        private const val KEY_SPEED_GUIDANCE_ARMED_TARGET_KMH =
+            "tracking_speed_guidance_armed_target_kmh"
+        private const val KEY_BRAKE_APPROACH_ANNOUNCED_STEP_ID =
+            "tracking_brake_approach_announced_step_id"
 
         private const val GPS_GATE_MIN_DISTANCE_M = 4_000.0
         private const val BRAKE_LINE_FALLBACK_RADIUS_M = 45.0
@@ -1499,9 +1882,14 @@ class DrivingTrackingService : Service() {
         private const val BRAKE_LINE_HALF_LENGTH_M = 60.0
         private const val SPEED_TARGET_TOLERANCE_KMH = 3.0
         private const val DECELERATION_TARGET_TOLERANCE_KMH = 6.0
+        private const val COMPLETE_STOP_MAX_RESIDUAL_SPEED_KMH = 10.0
         private const val LOCATION_UPDATE_INTERVAL_MS = 500L
         private const val LOCATION_UPDATE_MIN_DISTANCE_M = 0f
         private const val BRAKE_VOICE_REPEAT_DELAY_MS = 1_000L
+        private const val SPEED_GUIDANCE_VOICE_REPEAT_DELAY_MS = 3_000L
+        private const val APPROACH_TONE_DURATION_MS = 180
+        private const val APPROACH_TONE_INTERVAL_MS = 320L
+        private const val APPROACH_TONE_TO_VOICE_DELAY_MS = 320L
         private const val ROUTE_POINT_MIN_SPACING_M = 3.0
         private const val STATIONARY_DISTANCE_M = 4.0
         private const val MINIMUM_MOVING_SPEED_KMH = 0.8

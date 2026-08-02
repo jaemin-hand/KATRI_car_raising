@@ -49,6 +49,7 @@ data class TrackingSnapshot(
     val brakeLineLocation: GeoPoint?,
     val activeScenarioStepId: String?,
     val drivingActionState: DrivingActionState,
+    val speedGuidance: SpeedGuidance?,
     val currentRoutePoints: List<GeoPoint>,
     val referenceRoutePoints: List<GeoPoint>,
     val hasReferenceRoute: Boolean,

@@ -109,4 +109,38 @@ class DrivingSpeedRulesTest {
             )
         )
     }
+
+    @Test
+    fun completeStopAllowsTenKmhResidualOnlyWithStationaryEvidence() {
+        assertTrue(
+            DrivingSpeedRules.hasReachedDecelerationTarget(
+                targetKmh = 0,
+                displayedSpeedKmh = 4.5,
+                latestRawSpeedKmh = 10.0,
+                toleranceKmh = 6.0,
+                completeStopResidualSpeedKmh = 10.0,
+                hasStationaryEvidence = true
+            )
+        )
+        assertFalse(
+            DrivingSpeedRules.hasReachedDecelerationTarget(
+                targetKmh = 0,
+                displayedSpeedKmh = 4.5,
+                latestRawSpeedKmh = 10.0,
+                toleranceKmh = 6.0,
+                completeStopResidualSpeedKmh = 10.0,
+                hasStationaryEvidence = false
+            )
+        )
+        assertFalse(
+            DrivingSpeedRules.hasReachedDecelerationTarget(
+                targetKmh = 0,
+                displayedSpeedKmh = 4.5,
+                latestRawSpeedKmh = 10.1,
+                toleranceKmh = 6.0,
+                completeStopResidualSpeedKmh = 10.0,
+                hasStationaryEvidence = true
+            )
+        )
+    }
 }
