@@ -628,11 +628,14 @@ class DrivingTrackingService : Service() {
             if (isSessionActive() && acceptedDeltaM > 0.0) {
                 totalDistanceM += acceptedDeltaM
             }
-            if (sessionState == SessionState.Running && acceptedDeltaM > 0.0) {
-                appendCurrentRoutePoint(location)
-                updateTrackAreaState(location)
-                syncScenarioState()
-                evaluateLap(location)
+            if (sessionState == SessionState.Running) {
+                if (acceptedDeltaM > 0.0) {
+                    appendCurrentRoutePoint(location)
+                    updateTrackAreaState(location)
+                    syncScenarioState()
+                    evaluateLap(location)
+                }
+                // A complete-stop sample adds no distance but must still end deceleration.
                 updateDrivingActionState()
             }
             if (sessionState == SessionState.Paused) {
