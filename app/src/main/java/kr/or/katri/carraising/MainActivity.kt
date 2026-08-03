@@ -1699,8 +1699,8 @@ private class TrackPreviewView(context: android.content.Context) : View(context)
 
         projectedCurrent.lastOrNull()?.let { current ->
             val mapped = mapToView(current, transform)
-            canvas.drawCircle(mapped.x, mapped.y, dp(7).toFloat(), currentLocationOutlinePaint)
-            canvas.drawCircle(mapped.x, mapped.y, dp(4).toFloat(), currentLocationPaint)
+            canvas.drawCircle(mapped.x, mapped.y, dp(70).toFloat(), currentLocationOutlinePaint)
+            canvas.drawCircle(mapped.x, mapped.y, dp(40).toFloat(), currentLocationPaint)
         }
     }
 
