@@ -128,16 +128,47 @@ class BrakeApproachGuidanceTest {
     }
 
     @Test
-    fun accelDecelGuidanceOnlyArmsWhileWaitingForBrakeLine() {
+    fun accelDecelGuidanceRearmsForNextLapDuringReacceleration() {
         val step = KatriDrivingScenario.stepAt(1_350.0, PowertrainType.COMBUSTION)!!
         val monitor = BrakeApproachMonitor(requiredConsecutiveSamples = 1)
+
+        val firstLapGuidance = monitor.update(
+            sessionState = SessionState.Running,
+            step = step,
+            actionState = DrivingActionState.WAITING_FOR_BRAKE_LINE,
+            currentSpeedKmh = 130.0,
+            hasValidSpeedSample = true,
+            isGpsSignalStale = false,
+            traveledSinceBrakeLineM = 4_700.0,
+            remainingRouteDistanceM = 250.0,
+            straightLineDistanceM = 260.0
+        )
+        assertEquals(
+            BrakeApproachGuidanceType.PREPARE_TO_DECELERATE,
+            firstLapGuidance?.type
+        )
 
         assertNull(
             monitor.update(
                 sessionState = SessionState.Running,
                 step = step,
-                actionState = DrivingActionState.ACCELERATING,
+                actionState = DrivingActionState.WAITING_FOR_BRAKE_LINE,
                 currentSpeedKmh = 130.0,
+                hasValidSpeedSample = true,
+                isGpsSignalStale = false,
+                traveledSinceBrakeLineM = 4_710.0,
+                remainingRouteDistanceM = 245.0,
+                straightLineDistanceM = 255.0
+            )
+        )
+
+        monitor.resetForNextLap()
+        assertNull(
+            monitor.update(
+                sessionState = SessionState.Running,
+                step = step,
+                actionState = DrivingActionState.DECELERATING,
+                currentSpeedKmh = 110.0,
                 hasValidSpeedSample = true,
                 isGpsSignalStale = false,
                 traveledSinceBrakeLineM = 4_700.0,
@@ -146,10 +177,10 @@ class BrakeApproachGuidanceTest {
             )
         )
 
-        val guidance = monitor.update(
+        val secondLapGuidance = monitor.update(
             sessionState = SessionState.Running,
             step = step,
-            actionState = DrivingActionState.WAITING_FOR_BRAKE_LINE,
+            actionState = DrivingActionState.ACCELERATING,
             currentSpeedKmh = 130.0,
             hasValidSpeedSample = true,
             isGpsSignalStale = false,
@@ -159,7 +190,7 @@ class BrakeApproachGuidanceTest {
         )
         assertEquals(
             BrakeApproachGuidanceType.PREPARE_TO_DECELERATE,
-            guidance?.type
+            secondLapGuidance?.type
         )
     }
 

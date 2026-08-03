@@ -213,7 +213,8 @@ internal class BrakeApproachMonitor(
         return when (step.driveMode) {
             ScenarioDriveMode.CONSTANT -> actionState == DrivingActionState.CRUISING
             ScenarioDriveMode.ACCEL_DECEL ->
-                actionState == DrivingActionState.WAITING_FOR_BRAKE_LINE
+                actionState == DrivingActionState.WAITING_FOR_BRAKE_LINE ||
+                    actionState == DrivingActionState.ACCELERATING
         }
     }
 
