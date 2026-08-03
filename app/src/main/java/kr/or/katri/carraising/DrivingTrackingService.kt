@@ -1136,7 +1136,9 @@ class DrivingTrackingService : Service() {
             if (step == null) {
                 showDrivingAlert(
                     title = "시험 목표거리 도달",
-                    message = "설정된 주행 시나리오가 완료되었습니다."
+                    message = selectedPowertrain
+                        ?.let(KatriDrivingScenario::returnInstruction)
+                        ?: "설정된 주행 시나리오가 완료되었습니다."
                 )
             } else {
                 showDrivingAlert(

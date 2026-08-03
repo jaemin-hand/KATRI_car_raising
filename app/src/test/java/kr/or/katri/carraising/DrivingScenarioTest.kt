@@ -60,7 +60,7 @@ class DrivingScenarioTest {
         assertNull(KatriDrivingScenario.commonStepAt(-0.1))
         assertNull(KatriDrivingScenario.commonStepAt(3_000.0))
         assertNull(KatriDrivingScenario.commonStepAt(Double.NaN))
-        assertNull(KatriDrivingScenario.stepAt(9_000.0, PowertrainType.COMBUSTION))
+        assertNull(KatriDrivingScenario.stepAt(6_500.0, PowertrainType.COMBUSTION))
         assertNull(KatriDrivingScenario.stepAt(9_000.0, PowertrainType.HYBRID))
         assertNull(KatriDrivingScenario.stepAt(5_500.0, PowertrainType.ELECTRIC))
     }
@@ -89,6 +89,46 @@ class DrivingScenarioTest {
     }
 
     @Test
+    fun combustionScenarioEndsAtSixThousandFiveHundredKm() {
+        assertEquals(
+            6_500.0,
+            KatriDrivingScenario.targetDistanceKm(PowertrainType.COMBUSTION),
+            0.0
+        )
+        val finalStep =
+            KatriDrivingScenario.stepAt(6_499.9, PowertrainType.COMBUSTION)!!
+        assertEquals(ScenarioDriveMode.CONSTANT, finalStep.driveMode)
+        assertEquals(145, finalStep.targetSpeedKmh)
+        assertNull(KatriDrivingScenario.stepAt(6_500.0, PowertrainType.COMBUSTION))
+    }
+
+    @Test
+    fun hybridScenarioEndsAtEightThousandNineHundredKm() {
+        assertEquals(
+            8_900.0,
+            KatriDrivingScenario.targetDistanceKm(PowertrainType.HYBRID),
+            0.0
+        )
+        val finalStep = KatriDrivingScenario.stepAt(8_899.9, PowertrainType.HYBRID)!!
+        assertEquals(ScenarioDriveMode.CONSTANT, finalStep.driveMode)
+        assertEquals(145, finalStep.targetSpeedKmh)
+        assertNull(KatriDrivingScenario.stepAt(8_900.0, PowertrainType.HYBRID))
+    }
+
+    @Test
+    fun fuelReturnInstructionsMatchCombustionAndHybridRequirements() {
+        assertEquals(
+            "주유 경고등 점등 상태를 확인하고 차량을 반납하세요.",
+            KatriDrivingScenario.returnInstruction(PowertrainType.COMBUSTION)
+        )
+        assertEquals(
+            "주유 경고등 점등 상태를 확인하고 8,900km에 차량을 반납하세요.",
+            KatriDrivingScenario.returnInstruction(PowertrainType.HYBRID)
+        )
+        assertNull(KatriDrivingScenario.returnInstruction(PowertrainType.ELECTRIC))
+    }
+
+    @Test
     fun hybridRepeatsFullThreeThousandKilometerScenarioBlocks() {
         val firstRepeatedA = KatriDrivingScenario.stepAt(3_000.0, PowertrainType.HYBRID)!!
         assertEquals("A-1", firstRepeatedA.id)
@@ -106,8 +146,8 @@ class DrivingScenarioTest {
         assertEquals(60, secondRepeatedA.targetSpeedKmh)
         assertEquals(6_100.0, secondRepeatedA.endKm, 0.0)
 
-        val secondRepeatedWot = KatriDrivingScenario.stepAt(8_950.0, PowertrainType.HYBRID)!!
-        assertEquals("H-R5-2", secondRepeatedWot.id)
+        val secondRepeatedWot = KatriDrivingScenario.stepAt(8_750.0, PowertrainType.HYBRID)!!
+        assertEquals("H-R4-2", secondRepeatedWot.id)
         assertEquals(AccelerationMethod.WOT, secondRepeatedWot.accelerationMethod)
     }
 

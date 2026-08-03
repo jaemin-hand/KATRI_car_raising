@@ -40,7 +40,8 @@ data class DrivingScenarioStep(
 
 object KatriDrivingScenario {
     const val commonConfiguredEndKm = 3_000.0
-    const val testTargetKm = 9_000.0
+    const val combustionTestTargetKm = 6_500.0
+    const val hybridTestTargetKm = 8_900.0
     const val electricTestTargetKm = 5_500.0
 
     private val baseSteps: List<DrivingScenarioStep> = listOf(
@@ -102,8 +103,18 @@ object KatriDrivingScenario {
     fun targetDistanceKm(powertrainType: PowertrainType): Double {
         return when (powertrainType) {
             PowertrainType.ELECTRIC -> electricTestTargetKm
-            PowertrainType.COMBUSTION,
-            PowertrainType.HYBRID -> testTargetKm
+            PowertrainType.COMBUSTION -> combustionTestTargetKm
+            PowertrainType.HYBRID -> hybridTestTargetKm
+        }
+    }
+
+    fun returnInstruction(powertrainType: PowertrainType): String? {
+        return when (powertrainType) {
+            PowertrainType.COMBUSTION ->
+                "주유 경고등 점등 상태를 확인하고 차량을 반납하세요."
+            PowertrainType.HYBRID ->
+                "주유 경고등 점등 상태를 확인하고 8,900km에 차량을 반납하세요."
+            PowertrainType.ELECTRIC -> null
         }
     }
 

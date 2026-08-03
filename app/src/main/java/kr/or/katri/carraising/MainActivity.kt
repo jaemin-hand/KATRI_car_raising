@@ -112,7 +112,7 @@ class MainActivity : Activity() {
     private var btnStop: Button? = null
 
     private var selectedPowertrain: PowertrainType? = null
-    private var selectedTestMode = "9000km 고주로 주행"
+    private var selectedTestMode = "고주로 주행"
     private var selectedStartOdo = ""
     private var selectedTrackOdo = ""
 
@@ -645,7 +645,7 @@ class MainActivity : Activity() {
         content.addView(sectionTitle("시험"))
         content.addView(formLabel("시험 방식"))
         content.addView(
-            spinnerOf("시험 방식", "9000km 고주로 주행", "단거리 주행", "사용자 설정") {
+            spinnerOf("시험 방식", "고주로 주행", "단거리 주행", "사용자 설정") {
                 selectedTestMode = it
             }
         )
@@ -1208,9 +1208,13 @@ class MainActivity : Activity() {
             latestTrackingSnapshot?.testProgressDistanceKm ?: testProgressDistanceKm()
         val targetDistanceKm = selectedPowertrain
             ?.let(KatriDrivingScenario::targetDistanceKm)
-            ?: KatriDrivingScenario.testTargetKm
+            ?: KatriDrivingScenario.hybridTestTargetKm
         val scenarioStep =
             latestTrackingSnapshot?.scenarioStep ?: currentScenarioStep()
+        val hasReachedTarget =
+            selectedPowertrain != null && progressDistanceKm >= targetDistanceKm
+        val returnInstruction = selectedPowertrain
+            ?.let(KatriDrivingScenario::returnInstruction)
 
         tvSpeed?.text = String.format(Locale.US, "%.1f km/h", currentSpeedKmh)
         tvCurrentOdo?.text = currentOdoValueLabel()
@@ -1218,14 +1222,22 @@ class MainActivity : Activity() {
         tvBoundary?.text = trackAreaLabel()
         tvBrakeLine?.text = brakeLineStatusLabel(scenarioStep)
         if (scenarioStep == null) {
-            tvScenarioSection?.text = "시나리오 미설정"
+            tvScenarioSection?.text = if (hasReachedTarget) {
+                "시험 목표거리 도달"
+            } else {
+                "시나리오 미설정"
+            }
             tvScenarioProgress?.text = String.format(
                 Locale.US,
                 "현재 %.1fkm · 시험 범위 0~%.0fkm",
                 progressDistanceKm,
                 targetDistanceKm
             )
-            tvScenarioTarget?.text = "규정속도 -"
+            tvScenarioTarget?.text = if (hasReachedTarget) {
+                String.format(Locale.US, "반납 기준 %.0fkm", targetDistanceKm)
+            } else {
+                "규정속도 -"
+            }
         } else {
             val nextTransitionKm = max(0.0, scenarioStep.endKm - progressDistanceKm)
             tvScenarioSection?.text = "${scenarioStep.id} · ${scenarioStep.driveMode.label}"
@@ -1240,7 +1252,11 @@ class MainActivity : Activity() {
         }
         tvScenarioInstruction?.text = speedGuidance
             ?.let(TargetSpeedGuidanceRules::displayMessage)
-            ?: scenarioInstruction(scenarioStep)
+            ?: if (hasReachedTarget && returnInstruction != null) {
+                returnInstruction
+            } else {
+                scenarioInstruction(scenarioStep)
+            }
         tvScenarioInstruction?.setTextColor(
             when {
                 speedGuidance != null -> Color.rgb(194, 65, 12)
@@ -1271,14 +1287,10 @@ class MainActivity : Activity() {
     }
 
     private fun activeTestModeLabel(): String {
-        return if (
-            selectedPowertrain == PowertrainType.ELECTRIC &&
-            selectedTestMode == "9000km 고주로 주행"
-        ) {
-            "5500km 고주로 주행"
-        } else {
-            selectedTestMode
-        }
+        if (selectedTestMode != "고주로 주행") return selectedTestMode
+        val powertrain = selectedPowertrain ?: return selectedTestMode
+        val targetDistanceKm = KatriDrivingScenario.targetDistanceKm(powertrain)
+        return String.format(Locale.US, "%.0fkm 고주로 주행", targetDistanceKm)
     }
 
     private fun currentOdoKmOrNull(): Double? {
