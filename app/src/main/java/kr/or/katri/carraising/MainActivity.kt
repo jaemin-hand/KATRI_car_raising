@@ -42,6 +42,7 @@ import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import java.util.Locale
+import kotlin.math.atan2
 import kotlin.math.cos
 import kotlin.math.max
 import kotlin.math.min
@@ -245,6 +246,9 @@ class MainActivity : Activity() {
                 longitude = point.longitude
                 snapshot.currentLocationAccuracyM?.let {
                     accuracy = it
+                }
+                snapshot.currentLocationBearingDegrees?.let {
+                    bearing = it
                 }
             }
         }
@@ -450,13 +454,13 @@ class MainActivity : Activity() {
         val decelTarget = step.decelTargetKmh ?: 0
         return when (drivingActionState) {
             DrivingActionState.WAITING_FOR_BRAKE_LINE ->
-                "브레이크 시작선 통과 시 ${decelTarget}km/h까지 완감속"
+                "제동 시작점 통과 후\n${decelTarget}km/h까지 일반감속"
             DrivingActionState.DECELERATING ->
-                "완감속 중 · ${decelTarget}km/h까지 감속"
+                "일반감속 중\n${decelTarget}km/h까지 감속"
             DrivingActionState.ACCELERATING ->
                 "${step.accelerationMethod.label} · ${step.targetSpeedKmh}km/h까지 재가속"
             DrivingActionState.CRUISING ->
-                "브레이크 시작선 통과 대기"
+                "제동 시작점 통과 대기"
         }
     }
 
@@ -722,6 +726,7 @@ class MainActivity : Activity() {
         val body = FrameLayout(this)
         val trackOverlay = TrackPreviewView(this).also { view ->
             view.setReferenceRoute(referenceRoutePoints)
+            view.setCurrentRoute(currentRoutePoints)
             view.setBrakeLine(brakeLineLocation?.latitude, brakeLineLocation?.longitude)
             view.setBackgroundPresentation(true)
             view.isClickable = false
@@ -1356,7 +1361,10 @@ class MainActivity : Activity() {
                 isInTrack = insideTrackArea,
                 isRunning = sessionState == SessionState.Running,
                 latitude = location.latitude,
-                longitude = location.longitude
+                longitude = location.longitude,
+                bearingDegrees = location.bearing.takeIf {
+                    location.hasBearing() && currentSpeedKmh >= 5.0
+                }
             )
         }
     }
@@ -1644,13 +1652,21 @@ private class TrackPreviewView(context: android.content.Context) : View(context)
         strokeCap = Paint.Cap.ROUND
         color = Color.rgb(220, 38, 38)
     }
-    private val currentLocationOutlinePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.FILL
+    private val navigationMarkerShadowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL_AND_STROKE
+        strokeJoin = Paint.Join.ROUND
+        strokeWidth = dp(12).toFloat()
+        color = Color.rgb(15, 23, 42)
+    }
+    private val navigationMarkerOutlinePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL_AND_STROKE
+        strokeJoin = Paint.Join.ROUND
+        strokeWidth = dp(7).toFloat()
         color = Color.WHITE
     }
-    private val currentLocationPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+    private val navigationMarkerPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
-        color = Color.rgb(22, 163, 74)
+        color = Color.rgb(37, 99, 235)
     }
     private val labelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
@@ -1667,8 +1683,12 @@ private class TrackPreviewView(context: android.content.Context) : View(context)
     private val referenceRoute = ArrayList<GeoPoint>()
     private val maxRouteSize = 1_200
     private val minimumPointSpacingM = 0.8
+    private val minimumHeadingSegmentM = 3.0
     private val brakeLineHalfLengthM = 60f
     private var brakeLine: GeoPoint? = null
+    private var currentMarkerLocation: GeoPoint? = null
+    private var navigationHeadingDegrees = 0f
+    private var hasNavigationHeading = false
     private var inTrack = true
     private var running = false
     private var backgroundPresentation = false
@@ -1684,12 +1704,18 @@ private class TrackPreviewView(context: android.content.Context) : View(context)
         isInTrack: Boolean,
         isRunning: Boolean,
         latitude: Double? = null,
-        longitude: Double? = null
+        longitude: Double? = null,
+        bearingDegrees: Float? = null
     ) {
         inTrack = isInTrack
         running = isRunning
-        if (isRunning && latitude != null && longitude != null) {
-            addRoutePoint(GeoPoint(latitude, longitude))
+        if (latitude != null && longitude != null) {
+            val location = GeoPoint(latitude, longitude)
+            currentMarkerLocation = location
+            bearingDegrees
+                ?.takeIf { it.isFinite() }
+                ?.let(::updateNavigationHeading)
+            if (isRunning) addRoutePoint(location)
         }
         invalidate()
     }
@@ -1701,8 +1727,13 @@ private class TrackPreviewView(context: android.content.Context) : View(context)
     }
 
     fun setCurrentRoute(points: List<GeoPoint>) {
+        val visiblePoints = points.takeLast(maxRouteSize)
+        updateNavigationHeadingFromRoute(visiblePoints)
         currentRoute.clear()
-        currentRoute.addAll(points.takeLast(maxRouteSize))
+        currentRoute.addAll(visiblePoints)
+        if (currentMarkerLocation == null) {
+            currentMarkerLocation = currentRoute.lastOrNull()
+        }
         invalidate()
     }
 
@@ -1749,6 +1780,9 @@ private class TrackPreviewView(context: android.content.Context) : View(context)
             if (!backgroundPresentation) {
                 canvas.drawText("첫 랩 GPS 경로 수집 대기", dp(16).toFloat(), dp(20).toFloat(), labelPaint)
             }
+            if (currentMarkerLocation != null) {
+                drawNavigationMarker(canvas, PointF(width * 0.5f, height * 0.5f))
+            }
             return
         }
 
@@ -1756,6 +1790,9 @@ private class TrackPreviewView(context: android.content.Context) : View(context)
         val projectedReference = referenceRoute.map { project(it, projection) }
         val projectedCurrent = currentRoute.map { project(it, projection) }
         val projectedBrakeLine = brakeLine?.let { project(it, projection) }
+        val projectedCurrentLocation = currentMarkerLocation
+            ?.let { project(it, projection) }
+            ?: projectedCurrent.lastOrNull()
         val boundsPoints = if (projectedReference.isNotEmpty()) {
             projectedReference + listOfNotNull(projectedBrakeLine)
         } else {
@@ -1782,10 +1819,9 @@ private class TrackPreviewView(context: android.content.Context) : View(context)
             drawBrakeLine(canvas, projectedBrakeLine, projectedReference, projectedCurrent, transform)
         }
 
-        projectedCurrent.lastOrNull()?.let { current ->
+        projectedCurrentLocation?.let { current ->
             val mapped = mapToView(current, transform)
-            canvas.drawCircle(mapped.x, mapped.y, dp(70).toFloat(), currentLocationOutlinePaint)
-            canvas.drawCircle(mapped.x, mapped.y, dp(40).toFloat(), currentLocationPaint)
+            drawNavigationMarker(canvas, mapped)
         }
     }
 
@@ -1795,10 +1831,69 @@ private class TrackPreviewView(context: android.content.Context) : View(context)
         routePaint.alpha = if (backgroundAlpha) 78 else 255
         brakeLineOutlinePaint.alpha = if (backgroundAlpha) 190 else 255
         brakeLinePaint.alpha = if (backgroundAlpha) 170 else 255
-        currentLocationOutlinePaint.alpha = if (backgroundAlpha) 210 else 255
-        currentLocationPaint.alpha = if (backgroundAlpha) 165 else 255
+        navigationMarkerShadowPaint.alpha = if (backgroundAlpha) 45 else 70
+        navigationMarkerOutlinePaint.alpha = if (backgroundAlpha) 235 else 255
+        navigationMarkerPaint.alpha = if (backgroundAlpha) 220 else 255
         labelPaint.alpha = if (backgroundAlpha) 0 else 255
         brakeLabelPaint.alpha = if (backgroundAlpha) 0 else 255
+    }
+
+    private fun drawNavigationMarker(canvas: Canvas, center: PointF) {
+        val markerPath = Path().apply {
+            moveTo(0f, -dp(43).toFloat())
+            lineTo(dp(27).toFloat(), dp(31).toFloat())
+            lineTo(0f, dp(15).toFloat())
+            lineTo(-dp(27).toFloat(), dp(31).toFloat())
+            close()
+        }
+
+        canvas.save()
+        canvas.translate(center.x, center.y)
+        canvas.rotate(navigationHeadingDegrees)
+        canvas.save()
+        canvas.translate(0f, dp(2).toFloat())
+        canvas.drawPath(markerPath, navigationMarkerShadowPaint)
+        canvas.restore()
+        canvas.drawPath(markerPath, navigationMarkerOutlinePaint)
+        canvas.drawPath(markerPath, navigationMarkerPaint)
+        canvas.restore()
+    }
+
+    private fun updateNavigationHeadingFromRoute(points: List<GeoPoint>) {
+        val current = points.lastOrNull() ?: return
+        for (index in points.lastIndex - 1 downTo 0) {
+            val previous = points[index]
+            if (distanceMeters(previous, current) < minimumHeadingSegmentM) continue
+
+            val baseLatitude = (previous.latitude + current.latitude) * 0.5
+            val eastM = (current.longitude - previous.longitude) *
+                111_320.0 * cos(Math.toRadians(baseLatitude))
+            val northM = (current.latitude - previous.latitude) * 110_540.0
+            updateNavigationHeading(
+                Math.toDegrees(atan2(eastM, northM)).toFloat()
+            )
+            return
+        }
+    }
+
+    private fun updateNavigationHeading(nextHeadingDegrees: Float) {
+        val normalizedNext = normalizeHeading(nextHeadingDegrees)
+        if (!hasNavigationHeading) {
+            navigationHeadingDegrees = normalizedNext
+            hasNavigationHeading = true
+            return
+        }
+
+        val shortestDelta =
+            (normalizedNext - navigationHeadingDegrees + 540f) % 360f - 180f
+        navigationHeadingDegrees = normalizeHeading(
+            navigationHeadingDegrees + shortestDelta * 0.35f
+        )
+    }
+
+    private fun normalizeHeading(headingDegrees: Float): Float {
+        val normalized = headingDegrees % 360f
+        return if (normalized < 0f) normalized + 360f else normalized
     }
 
     private fun drawRoute(

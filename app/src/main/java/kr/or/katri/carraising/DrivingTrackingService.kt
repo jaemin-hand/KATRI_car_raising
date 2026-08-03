@@ -265,6 +265,9 @@ class DrivingTrackingService : Service() {
             currentLocation = location?.let { GeoPoint(it.latitude, it.longitude) },
             currentLocationProvider = location?.provider,
             currentLocationAccuracyM = location?.accuracy?.takeIf { location.hasAccuracy() },
+            currentLocationBearingDegrees = location
+                ?.bearing
+                ?.takeIf { location.hasBearing() && it.isFinite() },
             currentSpeedKmh = currentSpeedKmh,
             latestRawSpeedKmh = latestRawSpeedKmh,
             totalDistanceM = totalDistanceM,
