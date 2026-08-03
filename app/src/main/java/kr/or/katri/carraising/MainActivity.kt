@@ -22,8 +22,11 @@ import android.os.IBinder
 import android.os.Looper
 import android.text.InputType
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
+import android.view.WindowInsets
+import android.view.WindowInsetsController
 import android.view.WindowManager
 import android.view.inputmethod.InputMethodManager
 import android.widget.AdapterView
@@ -176,10 +179,18 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        updateSystemBarsForCurrentScreen()
         uiHandler.removeCallbacks(uiUpdateRunnable)
         uiHandler.post(uiUpdateRunnable)
         updateTrackUi()
         syncAlertFlashFromTrackingState()
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus && currentScreen == Screen.Track) {
+            setTrackImmersiveMode(true)
+        }
     }
 
     override fun onPause() {
@@ -461,17 +472,20 @@ class MainActivity : Activity() {
         stopAlertFlashLoop()
         currentScreen = Screen.Home
         setContentView(createHomeView())
+        updateSystemBarsForCurrentScreen()
     }
 
     private fun showPreparation() {
         currentScreen = Screen.Preparation
         setContentView(createPreparationView())
+        updateSystemBarsForCurrentScreen()
     }
 
     private fun showPowertrainSelection() {
         stopAlertFlashLoop()
         currentScreen = Screen.PowertrainSelection
         setContentView(createPowertrainSelectionView())
+        updateSystemBarsForCurrentScreen()
     }
 
     private fun showTrack() {
@@ -481,6 +495,7 @@ class MainActivity : Activity() {
         }
         currentScreen = Screen.Track
         setContentView(createTrackView())
+        updateSystemBarsForCurrentScreen()
         if (hasLocationPermission()) {
             trackingService?.startPreviewTracking()
         } else {
@@ -705,21 +720,15 @@ class MainActivity : Activity() {
         )
 
         val body = FrameLayout(this)
-        previewView = TrackPreviewView(this).also { view ->
+        val trackOverlay = TrackPreviewView(this).also { view ->
             view.setReferenceRoute(referenceRoutePoints)
             view.setBrakeLine(brakeLineLocation?.latitude, brakeLineLocation?.longitude)
             view.setBackgroundPresentation(true)
             view.isClickable = false
             view.isFocusable = false
             view.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
-            body.addView(
-                view,
-                FrameLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.MATCH_PARENT
-                )
-            )
         }
+        previewView = trackOverlay
 
         val scroll = ScrollView(this).apply {
             isFillViewport = true
@@ -915,7 +924,7 @@ class MainActivity : Activity() {
             minimumWidth = 0
             setPadding(dp(12), 0, dp(12), 0)
         }
-        btnClearBrakeLine = secondaryButton("시작선 초기화") {
+        btnClearBrakeLine = secondaryButton("브레이크 초기화") {
             confirmClearBrakeLine()
         }.apply {
             textSize = 13f
@@ -975,6 +984,13 @@ class MainActivity : Activity() {
                 ViewGroup.LayoutParams.MATCH_PARENT
             )
         )
+        body.addView(
+            trackOverlay,
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT
+            )
+        )
         root.addView(body, weightedContent())
         container.addView(root, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         alertFlashOverlay = View(this).apply {
@@ -990,7 +1006,74 @@ class MainActivity : Activity() {
                 ViewGroup.LayoutParams.MATCH_PARENT
             )
         )
+        applyTrackBottomInsets(container, content)
         return container
+    }
+
+    @Suppress("DEPRECATION")
+    private fun applyTrackBottomInsets(container: View, content: View) {
+        val baseLeft = content.paddingLeft
+        val baseTop = content.paddingTop
+        val baseRight = content.paddingRight
+        val baseBottom = content.paddingBottom
+
+        container.setOnApplyWindowInsetsListener { _, insets ->
+            val safeBottom = when {
+                Build.VERSION.SDK_INT >= Build.VERSION_CODES.R -> {
+                    val navigationBar = insets.getInsets(WindowInsets.Type.navigationBars()).bottom
+                    val mandatoryGesture =
+                        insets.getInsets(WindowInsets.Type.mandatorySystemGestures()).bottom
+                    max(navigationBar, mandatoryGesture)
+                }
+                Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q -> {
+                    max(
+                        insets.systemWindowInsetBottom,
+                        insets.mandatorySystemGestureInsets.bottom
+                    )
+                }
+                else -> insets.systemWindowInsetBottom
+            }
+            content.setPadding(
+                baseLeft,
+                baseTop,
+                baseRight,
+                max(baseBottom, safeBottom + dp(8))
+            )
+            insets
+        }
+        container.post { container.requestApplyInsets() }
+    }
+
+    private fun updateSystemBarsForCurrentScreen() {
+        setTrackImmersiveMode(currentScreen == Screen.Track)
+    }
+
+    @Suppress("DEPRECATION")
+    private fun setTrackImmersiveMode(enabled: Boolean) {
+        val decorView = window.decorView
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            decorView.windowInsetsController?.apply {
+                if (enabled) {
+                    systemBarsBehavior =
+                        WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                    hide(WindowInsets.Type.systemBars())
+                } else {
+                    show(WindowInsets.Type.systemBars())
+                }
+            }
+            return
+        }
+
+        decorView.systemUiVisibility = if (enabled) {
+            View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or
+                View.SYSTEM_UI_FLAG_FULLSCREEN or
+                View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
+                View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or
+                View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION or
+                View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+        } else {
+            View.SYSTEM_UI_FLAG_VISIBLE
+        }
     }
 
     private fun preparationItems(): List<PrepItem> = listOf(
@@ -1194,7 +1277,7 @@ class MainActivity : Activity() {
         btnSetBrakeLine?.text = if (brakeLineLocation == null) {
             "시작선 수동 설정"
         } else {
-            "시작선 재설정"
+            "브레이크 재설정"
         }
     }
 
@@ -1589,6 +1672,8 @@ private class TrackPreviewView(context: android.content.Context) : View(context)
     private var inTrack = true
     private var running = false
     private var backgroundPresentation = false
+
+    override fun onTouchEvent(event: MotionEvent): Boolean = false
 
     fun setBackgroundPresentation(enabled: Boolean) {
         backgroundPresentation = enabled
