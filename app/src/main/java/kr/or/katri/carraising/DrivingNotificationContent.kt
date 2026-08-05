@@ -93,4 +93,24 @@ internal object DrivingNotificationContent {
         }
         return "${step.targetSpeedKmh}km/h 주행 · $deceleration · ${step.accelerationMethod.label}"
     }
+
+    fun scenarioTransitionVoice(step: DrivingScenarioStep): String {
+        if (step.driveMode == ScenarioDriveMode.CONSTANT) {
+            return "${step.id} 정속 구간입니다. 규정속도 ${step.targetSpeedKmh}킬로미터로 감속 없이 주행하세요."
+        }
+
+        val decelTargetKmh = step.decelTargetKmh ?: 0
+        val deceleration = if (decelTargetKmh == 0) {
+            "제동 시작점 통과 후 완전 정차하고"
+        } else {
+            "제동 시작점 통과 후 시속 ${decelTargetKmh}킬로미터까지 일반감속하고"
+        }
+        val acceleration = when (step.accelerationMethod) {
+            AccelerationMethod.SMOOTH -> "완가속하세요."
+            AccelerationMethod.RAPID -> "급가속하세요."
+            AccelerationMethod.WOT -> "더블유 오 티로 가속하세요."
+            AccelerationMethod.NONE -> "규정속도를 유지하세요."
+        }
+        return "${step.id} 가감속 구간입니다. 규정속도 ${step.targetSpeedKmh}킬로미터. $deceleration $acceleration"
+    }
 }

@@ -61,6 +61,8 @@ class DrivingTrackingService : Service() {
 
     private var currentLocation: Location? = null
     private var previousLocationUpdateMs = 0L
+    private var distanceAnchorLocation: Location? = null
+    private var distanceAnchorReceivedAtMs = 0L
     private var totalDistanceM = 0.0
     private var lastGateDistanceM = 0.0
     private var wasInBrakeLineGate = false
@@ -98,6 +100,10 @@ class DrivingTrackingService : Service() {
     private var isSpeedGuidanceVoiceActive = false
     private var speedGuidanceVoiceUtteranceSequence = 0L
     private var currentSpeedGuidanceVoiceUtteranceId: String? = null
+    private var pendingScenarioTransitionVoiceMessage: String? = null
+    private var isScenarioTransitionVoiceActive = false
+    private var scenarioTransitionVoiceUtteranceSequence = 0L
+    private var currentScenarioTransitionVoiceUtteranceId: String? = null
 
     private val locationListener = object : LocationListener {
         override fun onLocationChanged(location: Location) {
@@ -237,6 +243,7 @@ class DrivingTrackingService : Service() {
         stopLocationUpdates()
         stopApproachGuidanceVoice()
         stopBrakeVoicePrompt()
+        stopScenarioTransitionVoice(clearPending = true)
         stopSpeedGuidanceVoice()
         textToSpeech?.shutdown()
         textToSpeech = null
@@ -384,6 +391,7 @@ class DrivingTrackingService : Service() {
         currentSpeedKmh = 0.0
         stopApproachGuidanceVoice()
         stopBrakeVoicePrompt()
+        stopScenarioTransitionVoice(clearPending = false)
         clearSpeedGuidance(resetArming = true)
         persistSessionState(force = true)
         notifyListeners()
@@ -396,6 +404,8 @@ class DrivingTrackingService : Service() {
         previousLocationUpdateMs = SystemClock.elapsedRealtime()
         syncScenarioState()
         resumeBrakeVoiceIfNeeded()
+        resumeApproachGuidanceVoiceIfNeeded()
+        resumeScenarioOrSpeedVoiceIfNeeded()
         updateSpeedGuidanceState()
         persistSessionState(force = true)
         notifyListeners()
@@ -405,11 +415,13 @@ class DrivingTrackingService : Service() {
     fun stopSession() {
         if (sessionState == SessionState.Idle || sessionState == SessionState.Ready) return
         sessionState = SessionState.Finished
+        clearDistanceAnchor()
         currentSpeedKmh = 0.0
         latestRawSpeedKmh = null
         stopApproachGuidanceVoice()
         brakeApproachMonitor.reset()
         stopBrakeVoicePrompt()
+        stopScenarioTransitionVoice(clearPending = true)
         clearSpeedGuidance(resetArming = true)
         persistSessionState(force = true)
         notifyListeners()
@@ -421,6 +433,7 @@ class DrivingTrackingService : Service() {
     }
 
     fun resetToReady() {
+        clearDistanceAnchor()
         totalDistanceM = 0.0
         lastGateDistanceM = 0.0
         wasInBrakeLineGate = false
@@ -434,6 +447,7 @@ class DrivingTrackingService : Service() {
         sessionState = SessionState.Ready
         stopApproachGuidanceVoice()
         stopBrakeVoicePrompt()
+        stopScenarioTransitionVoice(clearPending = true)
         clearSpeedGuidance(resetArming = true)
         persistSessionState(force = true)
         notifyListeners()
@@ -491,11 +505,14 @@ class DrivingTrackingService : Service() {
         drivingActionState = DrivingActionState.CRUISING
         brakeApproachMonitor.reset()
         stopApproachGuidanceVoice()
+        stopScenarioTransitionVoice(clearPending = true)
         clearSpeedGuidance(resetArming = true)
         currentRoutePoints.clear()
         appendCurrentRoutePoint(now, force = true)
         wasInBrakeLineGate = isInBrakeLineGate(now)
-        previousLocationUpdateMs = SystemClock.elapsedRealtime()
+        val nowMs = SystemClock.elapsedRealtime()
+        previousLocationUpdateMs = nowMs
+        setDistanceAnchor(now, nowMs)
         sessionState = SessionState.Running
         syncScenarioState()
         persistSessionState(force = true)
@@ -509,6 +526,7 @@ class DrivingTrackingService : Service() {
         sessionState = if (brakeLineLocation == null) SessionState.Idle else SessionState.Ready
         brakeApproachMonitor.reset()
         stopApproachGuidanceVoice()
+        stopScenarioTransitionVoice(clearPending = true)
         clearSpeedGuidance(resetArming = true)
         persistSessionState(force = true)
         notifyListeners()
@@ -622,11 +640,7 @@ class DrivingTrackingService : Service() {
             hasStationaryEvidenceForControl =
                 speedSample.isValidForControl && speedSample.hasStationaryEvidence
             currentSpeedKmh = smoothSpeedKmh(speedSample.speedKmh)
-            val acceptedDeltaM = if (shouldAcceptMovement(location, deltaM, currentSpeedKmh)) {
-                deltaM
-            } else {
-                0.0
-            }
+            val acceptedDeltaM = acceptedDistanceDelta(location, nowMs, currentSpeedKmh)
 
             if (isSessionActive() && acceptedDeltaM > 0.0) {
                 totalDistanceM += acceptedDeltaM
@@ -649,6 +663,7 @@ class DrivingTrackingService : Service() {
             latestRawSpeedKmh = speedSample.speedKmh.takeIf { speedSample.isValidForControl }
             hasStationaryEvidenceForControl = false
             currentSpeedKmh = smoothSpeedKmh(speedSample.speedKmh)
+            acceptedDistanceDelta(location, nowMs, currentSpeedKmh)
         }
 
         previousLocationUpdateMs = nowMs
@@ -736,11 +751,74 @@ class DrivingTrackingService : Service() {
             rawSpeedKmh * SPEED_SMOOTHING_ALPHA
     }
 
-    private fun shouldAcceptMovement(location: Location, deltaM: Double, speedKmh: Double): Boolean {
-        val trustedGpsMovement = isTrustedGpsSpeed(location) && deltaM >= 0.5
-        return isUsableLocation(location) &&
-            speedKmh >= MINIMUM_MOVING_SPEED_KMH &&
-            (deltaM >= STATIONARY_DISTANCE_M || trustedGpsMovement)
+    private fun acceptedDistanceDelta(
+        location: Location,
+        receivedAtMs: Long,
+        movementSpeedKmh: Double
+    ): Double {
+        if (!isSessionActive()) return 0.0
+
+        val currentAccuracyM = location.accuracy.takeIf { location.hasAccuracy() }
+        val anchor = distanceAnchorLocation
+        if (anchor == null) {
+            if (GpsDistanceRules.hasUsableAccuracy(currentAccuracyM)) {
+                setDistanceAnchor(location, receivedAtMs)
+            }
+            return 0.0
+        }
+
+        val previousAccuracyM = anchor.accuracy.takeIf { anchor.hasAccuracy() }
+        val segmentDistanceM = anchor.distanceTo(location).coerceAtLeast(0f).toDouble()
+        val elapsedSeconds = distanceElapsedSeconds(anchor, location, receivedAtMs)
+        val currentGpsSpeedMps = if (isTrustedGpsSpeed(location)) {
+            location.speed.toDouble()
+        } else {
+            null
+        }
+        return when (
+            GpsDistanceRules.evaluateSegment(
+                segmentDistanceM = segmentDistanceM,
+                elapsedSeconds = elapsedSeconds,
+                previousAccuracyM = previousAccuracyM,
+                currentAccuracyM = currentAccuracyM,
+                movementSpeedKmh = movementSpeedKmh,
+                currentGpsSpeedMps = currentGpsSpeedMps,
+                minimumMovingSpeedKmh = MINIMUM_MOVING_SPEED_KMH
+            )
+        ) {
+            DistanceAnchorAction.HOLD -> 0.0
+            DistanceAnchorAction.ACCEPT -> {
+                setDistanceAnchor(location, receivedAtMs)
+                segmentDistanceM
+            }
+            DistanceAnchorAction.RESET -> {
+                setDistanceAnchor(location, receivedAtMs)
+                0.0
+            }
+        }
+    }
+
+    private fun distanceElapsedSeconds(
+        anchor: Location,
+        location: Location,
+        receivedAtMs: Long
+    ): Double {
+        val anchorNanos = anchor.elapsedRealtimeNanos
+        val locationNanos = location.elapsedRealtimeNanos
+        if (anchorNanos > 0L && locationNanos > anchorNanos) {
+            return (locationNanos - anchorNanos) / 1_000_000_000.0
+        }
+        return (receivedAtMs - distanceAnchorReceivedAtMs).coerceAtLeast(0L) / 1000.0
+    }
+
+    private fun setDistanceAnchor(location: Location, receivedAtMs: Long) {
+        distanceAnchorLocation = Location(location)
+        distanceAnchorReceivedAtMs = receivedAtMs
+    }
+
+    private fun clearDistanceAnchor() {
+        distanceAnchorLocation = null
+        distanceAnchorReceivedAtMs = 0L
     }
 
     private fun isUsableLocation(location: Location): Boolean {
@@ -992,6 +1070,7 @@ class DrivingTrackingService : Service() {
                 ScenarioDriveMode.ACCEL_DECEL -> DrivingActionState.WAITING_FOR_BRAKE_LINE
                 else -> DrivingActionState.CRUISING
             }
+            resumeScenarioOrSpeedVoiceIfNeeded()
             persistSessionState(force = true)
             notifyListeners()
             updateForegroundNotification(force = true)
@@ -1137,19 +1216,27 @@ class DrivingTrackingService : Service() {
         stopApproachGuidanceVoice()
         stopBrakeVoicePrompt()
         clearSpeedGuidance(resetArming = false)
+        stopScenarioTransitionVoice(clearPending = true)
 
         if (sessionState == SessionState.Running && previousStepId != null) {
             if (step == null) {
+                val returnInstruction = selectedPowertrain
+                    ?.let(KatriDrivingScenario::returnInstruction)
+                    ?: "설정된 주행 시나리오가 완료되었습니다."
                 showDrivingAlert(
                     title = "시험 목표거리 도달",
-                    message = selectedPowertrain
-                        ?.let(KatriDrivingScenario::returnInstruction)
-                        ?: "설정된 주행 시나리오가 완료되었습니다."
+                    message = returnInstruction
+                )
+                queueScenarioTransitionVoice(
+                    "시험 목표거리에 도달했습니다. $returnInstruction"
                 )
             } else {
                 showDrivingAlert(
                     title = "시나리오 전환 · ${step.id}",
                     message = DrivingNotificationContent.scenarioTransition(step)
+                )
+                queueScenarioTransitionVoice(
+                    DrivingNotificationContent.scenarioTransitionVoice(step)
                 )
             }
         }
@@ -1161,6 +1248,7 @@ class DrivingTrackingService : Service() {
         if (step.driveMode != ScenarioDriveMode.ACCEL_DECEL) {
             drivingActionState = DrivingActionState.CRUISING
             stopBrakeVoicePrompt()
+            resumeScenarioOrSpeedVoiceIfNeeded()
             return
         }
 
@@ -1170,6 +1258,7 @@ class DrivingTrackingService : Service() {
                 if (hasReachedDecelerationTarget(target)) {
                     drivingActionState = DrivingActionState.ACCELERATING
                     stopBrakeVoicePrompt()
+                    resumeScenarioOrSpeedVoiceIfNeeded()
                 }
             }
             DrivingActionState.ACCELERATING -> {
@@ -1244,6 +1333,7 @@ class DrivingTrackingService : Service() {
                         override fun onDone(utteranceId: String?) {
                             onApproachGuidanceUtteranceFinished(utteranceId)
                             onBrakeVoiceUtteranceFinished(utteranceId, failed = false)
+                            onScenarioTransitionVoiceUtteranceFinished(utteranceId)
                             onSpeedGuidanceUtteranceFinished(utteranceId, failed = false)
                         }
 
@@ -1251,6 +1341,7 @@ class DrivingTrackingService : Service() {
                         override fun onError(utteranceId: String?) {
                             onApproachGuidanceUtteranceFinished(utteranceId)
                             onBrakeVoiceUtteranceFinished(utteranceId, failed = true)
+                            onScenarioTransitionVoiceUtteranceFinished(utteranceId)
                             onSpeedGuidanceUtteranceFinished(utteranceId, failed = true)
                         }
                     })
@@ -1259,13 +1350,14 @@ class DrivingTrackingService : Service() {
             mainHandler.post {
                 resumeBrakeVoiceIfNeeded()
                 resumeApproachGuidanceVoiceIfNeeded()
-                resumeSpeedGuidanceVoiceIfNeeded()
+                resumeScenarioOrSpeedVoiceIfNeeded()
             }
         }
     }
 
     private fun startApproachGuidanceVoice(guidance: BrakeApproachGuidance) {
         stopSpeedGuidanceVoice()
+        stopScenarioTransitionVoice(clearPending = false)
         stopApproachGuidanceVoice()
         activeApproachGuidance = guidance
         isApproachGuidanceVoiceActive = true
@@ -1305,7 +1397,12 @@ class DrivingTrackingService : Service() {
         isApproachGuidanceVoiceActive = false
         isApproachToneSequenceActive = false
         currentApproachGuidanceVoiceUtteranceId = null
-        if (hadActivePrompt && !isBrakeVoiceActive && !isSpeedGuidanceVoiceActive) {
+        if (
+            hadActivePrompt &&
+            !isBrakeVoiceActive &&
+            !isScenarioTransitionVoiceActive &&
+            !isSpeedGuidanceVoiceActive
+        ) {
             textToSpeech?.stop()
         }
     }
@@ -1364,12 +1461,13 @@ class DrivingTrackingService : Service() {
         isApproachGuidanceVoiceActive = false
         isApproachToneSequenceActive = false
         currentApproachGuidanceVoiceUtteranceId = null
-        resumeSpeedGuidanceVoiceIfNeeded()
+        resumeScenarioOrSpeedVoiceIfNeeded()
     }
 
     private fun startBrakeVoicePrompt(step: DrivingScenarioStep) {
         val targetKmh = step.decelTargetKmh ?: return
         stopApproachGuidanceVoice()
+        stopScenarioTransitionVoice(clearPending = false)
         clearSpeedGuidance(resetArming = false)
         stopBrakeVoicePrompt()
         brakeVoiceTargetKmh = targetKmh
@@ -1445,10 +1543,107 @@ class DrivingTrackingService : Service() {
         }
     }
 
+    private fun queueScenarioTransitionVoice(message: String) {
+        stopScenarioTransitionVoice(clearPending = true)
+        pendingScenarioTransitionVoiceMessage = message
+        resumeScenarioOrSpeedVoiceIfNeeded()
+    }
+
+    private fun resumeScenarioOrSpeedVoiceIfNeeded() {
+        if (!resumeScenarioTransitionVoiceIfNeeded()) {
+            resumeSpeedGuidanceVoiceIfNeeded()
+        }
+    }
+
+    private fun resumeScenarioTransitionVoiceIfNeeded(): Boolean {
+        val message = pendingScenarioTransitionVoiceMessage ?: return false
+        if (
+            sessionState != SessionState.Running ||
+            isBrakeVoiceActive ||
+            isApproachGuidanceVoiceActive
+        ) {
+            return true
+        }
+        if (
+            isScenarioTransitionVoiceActive ||
+            currentScenarioTransitionVoiceUtteranceId != null
+        ) {
+            return true
+        }
+
+        stopSpeedGuidanceVoice()
+        if (!isTextToSpeechInitializationComplete) return true
+
+        val engine = textToSpeech
+        if (!isTextToSpeechReady || engine == null) {
+            pendingScenarioTransitionVoiceMessage = null
+            return false
+        }
+
+        scenarioTransitionVoiceUtteranceSequence += 1L
+        val utteranceId =
+            "scenario-transition-$scenarioTransitionVoiceUtteranceSequence"
+        isScenarioTransitionVoiceActive = true
+        currentScenarioTransitionVoiceUtteranceId = utteranceId
+        val result = engine.speak(
+            message,
+            TextToSpeech.QUEUE_FLUSH,
+            null,
+            utteranceId
+        )
+        if (result == TextToSpeech.ERROR) {
+            pendingScenarioTransitionVoiceMessage = null
+            isScenarioTransitionVoiceActive = false
+            currentScenarioTransitionVoiceUtteranceId = null
+            return false
+        }
+        return true
+    }
+
+    private fun stopScenarioTransitionVoice(clearPending: Boolean) {
+        val hadActivePrompt =
+            isScenarioTransitionVoiceActive ||
+                currentScenarioTransitionVoiceUtteranceId != null
+        isScenarioTransitionVoiceActive = false
+        currentScenarioTransitionVoiceUtteranceId = null
+        if (clearPending) {
+            pendingScenarioTransitionVoiceMessage = null
+        }
+        if (
+            hadActivePrompt &&
+            !isBrakeVoiceActive &&
+            !isApproachGuidanceVoiceActive &&
+            !isSpeedGuidanceVoiceActive
+        ) {
+            textToSpeech?.stop()
+        }
+    }
+
+    private fun onScenarioTransitionVoiceUtteranceFinished(utteranceId: String?) {
+        mainHandler.post {
+            if (
+                !isScenarioTransitionVoiceActive ||
+                utteranceId != currentScenarioTransitionVoiceUtteranceId
+            ) {
+                return@post
+            }
+            pendingScenarioTransitionVoiceMessage = null
+            isScenarioTransitionVoiceActive = false
+            currentScenarioTransitionVoiceUtteranceId = null
+            resumeSpeedGuidanceVoiceIfNeeded()
+        }
+    }
+
+    private fun hasScenarioTransitionVoiceWork(): Boolean {
+        return pendingScenarioTransitionVoiceMessage != null ||
+            isScenarioTransitionVoiceActive
+    }
+
     private fun startSpeedGuidanceVoice() {
         if (
             isBrakeVoiceActive ||
             isApproachGuidanceVoiceActive ||
+            hasScenarioTransitionVoiceWork() ||
             speedGuidanceMonitor.guidance == null
         ) {
             return
@@ -1462,6 +1657,7 @@ class DrivingTrackingService : Service() {
         if (
             isBrakeVoiceActive ||
             isApproachGuidanceVoiceActive ||
+            hasScenarioTransitionVoiceWork() ||
             sessionState != SessionState.Running ||
             speedGuidanceMonitor.guidance == null
         ) return
@@ -1484,7 +1680,8 @@ class DrivingTrackingService : Service() {
         if (
             hadActivePrompt &&
             !isBrakeVoiceActive &&
-            !isApproachGuidanceVoiceActive
+            !isApproachGuidanceVoiceActive &&
+            !isScenarioTransitionVoiceActive
         ) {
             textToSpeech?.stop()
         }
@@ -1497,6 +1694,7 @@ class DrivingTrackingService : Service() {
             !isSpeedGuidanceVoiceActive ||
             isBrakeVoiceActive ||
             isApproachGuidanceVoiceActive ||
+            hasScenarioTransitionVoiceWork() ||
             sessionState != SessionState.Running ||
             guidance == null
         ) {

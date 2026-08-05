@@ -59,6 +59,36 @@ class DrivingNotificationContentTest {
     }
 
     @Test
+    fun constantScenarioTransitionVoiceExplainsTargetSpeed() {
+        val step = KatriDrivingScenario.stepAt(350.0, PowertrainType.COMBUSTION)!!
+
+        assertEquals(
+            "B-1 정속 구간입니다. 규정속도 80킬로미터로 감속 없이 주행하세요.",
+            DrivingNotificationContent.scenarioTransitionVoice(step)
+        )
+    }
+
+    @Test
+    fun completeStopScenarioTransitionVoiceExplainsSmoothAcceleration() {
+        val step = KatriDrivingScenario.stepAt(150.0, PowertrainType.COMBUSTION)!!
+
+        assertEquals(
+            "A-2 가감속 구간입니다. 규정속도 60킬로미터. 제동 시작점 통과 후 완전 정차하고 완가속하세요.",
+            DrivingNotificationContent.scenarioTransitionVoice(step)
+        )
+    }
+
+    @Test
+    fun wotScenarioTransitionVoicePronouncesAccelerationMethod() {
+        val step = KatriDrivingScenario.stepAt(2_150.0, PowertrainType.COMBUSTION)!!
+
+        assertEquals(
+            "H-R1-2 가감속 구간입니다. 규정속도 145킬로미터. 제동 시작점 통과 후 시속 110킬로미터까지 일반감속하고 더블유 오 티로 가속하세요.",
+            DrivingNotificationContent.scenarioTransitionVoice(step)
+        )
+    }
+
+    @Test
     fun speedGuidanceOverridesNormalCruiseInstruction() {
         val step = KatriDrivingScenario.stepAt(1_250.0, PowertrainType.COMBUSTION)!!
         val guidance = TargetSpeedGuidanceRules.evaluate(

@@ -32,6 +32,17 @@ class OdometerRulesTest {
     }
 
     @Test
+    fun editTextUsesCurrentAccumulatedOdo() {
+        val currentOdo = OdometerRules.currentOdoKm(
+            confirmedOdoKm = 1_000.0,
+            trackedDistanceM = 100_120.0,
+            confirmationDistanceM = 0.0
+        )
+
+        assertEquals("1100.12", OdometerRules.editableOdoText(currentOdo))
+    }
+
+    @Test
     fun missingOdoRemainsUnset() {
         assertNull(
             OdometerRules.currentOdoKm(

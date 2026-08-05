@@ -100,9 +100,6 @@ class MainActivity : Activity() {
 
     private var previewView: TrackPreviewView? = null
     private var tvSpeed: TextView? = null
-    private var tvStatus: TextView? = null
-    private var tvBoundary: TextView? = null
-    private var tvBrakeLine: TextView? = null
     private var tvCurrentOdo: TextView? = null
     private var tvScenarioSection: TextView? = null
     private var tvScenarioProgress: TextView? = null
@@ -464,14 +461,6 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun currentStatusLabel(): String = when (sessionState) {
-        SessionState.Idle -> "상태: 대기"
-        SessionState.Ready -> "상태: 대기"
-        SessionState.Running -> "상태: 주행 중"
-        SessionState.Paused -> "상태: 일시정지"
-        SessionState.Finished -> "상태: 종료"
-    }
-
     private fun showHome() {
         stopAlertFlashLoop()
         currentScreen = Screen.Home
@@ -612,19 +601,19 @@ class MainActivity : Activity() {
             setPadding(dp(24), dp(24), dp(24), dp(24))
         }
         content.addView(
-            primaryButton("내연기관 차량") {
+            primaryButton("내연기관") {
                 selectPowertrainAndShowTrack(PowertrainType.COMBUSTION)
             },
             largeButton()
         )
         content.addView(
-            primaryButton("하이브리드 차량") {
+            primaryButton("하이브리드") {
                 selectPowertrainAndShowTrack(PowertrainType.HYBRID)
             },
             largeButton()
         )
         content.addView(
-            primaryButton("전기 차량") {
+            primaryButton("전기") {
                 selectPowertrainAndShowTrack(PowertrainType.ELECTRIC)
             },
             largeButton()
@@ -745,6 +734,8 @@ class MainActivity : Activity() {
             setBackgroundColor(Color.TRANSPARENT)
         }
 
+        // Leave the upper route preview open and place primary driving metrics below it.
+        content.addView(space(dp(104)))
         content.addView(sectionTitle("측정"))
 
         tvSpeed = metricTextView("0.0 km/h").apply {
@@ -782,7 +773,9 @@ class MainActivity : Activity() {
         trackOdoActionButton.setOnClickListener {
             if (!isTrackOdoEditing) {
                 isTrackOdoEditing = true
-                val savedOdo = currentOdoKmOrNull()?.let(::formatOdoInput)
+                val currentOdo = latestTrackingSnapshot?.currentOdoKm
+                    ?: currentOdoKmOrNull()
+                val savedOdo = OdometerRules.editableOdoText(currentOdo)
                     ?: selectedTrackOdo.ifEmpty { selectedStartOdo }
                 trackOdoInput.setText(savedOdo)
                 trackOdoInput.setSelection(trackOdoInput.text.length)
@@ -881,10 +874,6 @@ class MainActivity : Activity() {
         }
         updateTrackOdoMode()
 
-        tvStatus = metricTextView(currentStatusLabel())
-        tvBoundary = metricTextView("고주로: 확인 중")
-        tvBrakeLine = metricTextView("브레이크 시작선: 미설정")
-
         content.addView(
             metricRow(
                 metricCard("속도", tvSpeed!!).apply {
@@ -892,16 +881,6 @@ class MainActivity : Activity() {
                 },
                 odoCard
             )
-        )
-        content.addView(
-            cardContainer().apply {
-                orientation = LinearLayout.VERTICAL
-                background = trackSurfaceBackground()
-                setPadding(dp(4), dp(6), dp(4), dp(6))
-                addView(tvStatus)
-                addView(tvBoundary)
-                addView(tvBrakeLine)
-            }
         )
 
         content.addView(sectionTitle("현재 시나리오"))
@@ -1306,9 +1285,6 @@ class MainActivity : Activity() {
 
         tvSpeed?.text = String.format(Locale.US, "%.1f km/h", currentSpeedKmh)
         tvCurrentOdo?.text = currentOdoValueLabel()
-        tvStatus?.text = currentStatusLabel()
-        tvBoundary?.text = trackAreaLabel()
-        tvBrakeLine?.text = brakeLineStatusLabel(scenarioStep)
         if (scenarioStep == null) {
             tvScenarioSection?.text = if (hasReachedTarget) {
                 "시험 목표거리 도달"
@@ -1369,14 +1345,6 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun trackAreaLabel(): String {
-        return when {
-            !hasReferenceRoute -> "고주로: 기준 경로 학습 중"
-            insideTrackArea -> "고주로: 기준 경로 내"
-            else -> "고주로: 기준 경로 이탈"
-        }
-    }
-
     private fun activeTestModeLabel(): String {
         if (selectedTestMode != "고주로 주행") return selectedTestMode
         val powertrain = selectedPowertrain ?: return selectedTestMode
@@ -1396,23 +1364,6 @@ class MainActivity : Activity() {
     private fun currentOdoValueLabel(): String {
         val currentOdo = currentOdoKmOrNull() ?: return "미입력"
         return String.format(Locale.US, "%.2f km", currentOdo)
-    }
-
-    private fun formatOdoInput(odoKm: Double): String {
-        return String.format(Locale.US, "%.2f", odoKm).trimEnd('0').trimEnd('.')
-    }
-
-    private fun brakeLineStatusLabel(step: DrivingScenarioStep?): String {
-        if (brakeLineLocation == null) return "브레이크 시작선: 미설정"
-        if (step?.driveMode != ScenarioDriveMode.ACCEL_DECEL) {
-            return "브레이크 시작선: 설정됨 · 현재 구간 감속 경보 없음"
-        }
-        return when (drivingActionState) {
-            DrivingActionState.WAITING_FOR_BRAKE_LINE -> "브레이크 시작선: 통과 대기"
-            DrivingActionState.DECELERATING -> "브레이크 시작선: 통과 · 완감속 중"
-            DrivingActionState.ACCELERATING -> "브레이크 시작선: 통과 · 재가속 중"
-            DrivingActionState.CRUISING -> "브레이크 시작선: 설정됨"
-        }
     }
 
     private fun confirmedOdoProgressKmOrNull(): Double? {

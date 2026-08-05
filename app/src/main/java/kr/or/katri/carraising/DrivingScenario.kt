@@ -1,9 +1,9 @@
 package kr.or.katri.carraising
 
 enum class PowertrainType(val label: String) {
-    COMBUSTION("내연기관 차량"),
-    HYBRID("하이브리드 차량"),
-    ELECTRIC("전기 차량")
+    COMBUSTION("내연기관"),
+    HYBRID("하이브리드"),
+    ELECTRIC("전기")
 }
 
 enum class ScenarioDriveMode(val label: String) {
