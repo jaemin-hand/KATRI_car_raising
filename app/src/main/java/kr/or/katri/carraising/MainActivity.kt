@@ -73,6 +73,7 @@ class MainActivity : Activity() {
 
     private var totalDistanceM = 0.0
     private var currentSpeedKmh = 0.0
+    private var isGpsSignalStale = false
     private var insideTrackArea = true
     private var brakeLineLocation: Location? = null
     private var drivingActionState = DrivingActionState.CRUISING
@@ -105,6 +106,7 @@ class MainActivity : Activity() {
     private var tvScenarioProgress: TextView? = null
     private var tvScenarioTarget: TextView? = null
     private var tvScenarioInstruction: TextView? = null
+    private var trackStatusBar: View? = null
     private var alertFlashOverlay: View? = null
 
     private var btnSetBrakeLine: Button? = null
@@ -251,6 +253,7 @@ class MainActivity : Activity() {
         }
         totalDistanceM = snapshot.totalDistanceM
         currentSpeedKmh = snapshot.currentSpeedKmh
+        isGpsSignalStale = snapshot.isGpsSignalStale
         insideTrackArea = snapshot.insideTrackArea
         brakeLineLocation = snapshot.brakeLineLocation?.let { point ->
             Location("tracking_service").apply {
@@ -709,6 +712,16 @@ class MainActivity : Activity() {
             toolbar(
                 "고주로 주행",
                 "${selectedPowertrain?.label} / ${activeTestModeLabel()}"
+            )
+        )
+        trackStatusBar = View(this).apply {
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_YES
+        }
+        root.addView(
+            trackStatusBar,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                dp(5)
             )
         )
 
@@ -1266,6 +1279,7 @@ class MainActivity : Activity() {
     }
 
     private fun updateTrackUi() {
+        updateTrackStatusBar()
         if (sessionState != SessionState.Running) {
             stopAlertFlashLoop()
         }
@@ -1343,6 +1357,34 @@ class MainActivity : Activity() {
                 }
             )
         }
+    }
+
+    private fun updateTrackStatusBar() {
+        if (currentScreen != Screen.Track) return
+        val state = TrackStatusBarRules.resolve(
+            sessionState = sessionState,
+            actionState = drivingActionState,
+            hasSpeedGuidance = speedGuidance != null,
+            isGpsSignalStale = isGpsSignalStale
+        )
+        val color = when (state) {
+            TrackStatusBarState.INACTIVE -> ScreenColors.StatusInactive
+            TrackStatusBarState.NORMAL -> ScreenColors.StatusNormal
+            TrackStatusBarState.SPEED_WARNING -> ScreenColors.StatusSpeedWarning
+            TrackStatusBarState.BRAKING -> ScreenColors.StatusBraking
+            TrackStatusBarState.GPS_ISSUE -> ScreenColors.StatusGpsIssue
+            TrackStatusBarState.PAUSED -> ScreenColors.StatusPaused
+        }
+        val description = when (state) {
+            TrackStatusBarState.INACTIVE -> "주행 대기"
+            TrackStatusBarState.NORMAL -> "정상 주행"
+            TrackStatusBarState.SPEED_WARNING -> "규정속도 이탈"
+            TrackStatusBarState.BRAKING -> "감속 진행 중"
+            TrackStatusBarState.GPS_ISSUE -> "GPS 신호 이상"
+            TrackStatusBarState.PAUSED -> "주행 일시정지"
+        }
+        trackStatusBar?.setBackgroundColor(color)
+        trackStatusBar?.contentDescription = description
     }
 
     private fun activeTestModeLabel(): String {
@@ -1977,4 +2019,10 @@ private object ScreenColors {
     val MutedText = Color.rgb(71, 85, 105)
     val Primary = Color.rgb(30, 64, 175)
     val Border = Color.rgb(203, 213, 225)
+    val StatusInactive = Color.rgb(203, 213, 225)
+    val StatusNormal = Color.rgb(22, 163, 74)
+    val StatusSpeedWarning = Color.rgb(234, 88, 12)
+    val StatusBraking = Color.rgb(220, 38, 38)
+    val StatusGpsIssue = Color.rgb(234, 179, 8)
+    val StatusPaused = Color.rgb(100, 116, 139)
 }

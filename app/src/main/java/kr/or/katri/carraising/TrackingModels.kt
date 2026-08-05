@@ -42,6 +42,7 @@ data class TrackingSnapshot(
     val currentLocationBearingDegrees: Float?,
     val currentSpeedKmh: Double,
     val latestRawSpeedKmh: Double?,
+    val isGpsSignalStale: Boolean,
     val totalDistanceM: Double,
     val testProgressDistanceKm: Double,
     val currentOdoKm: Double?,

@@ -16,6 +16,7 @@ import android.location.LocationListener
 import android.location.LocationManager
 import android.media.AudioAttributes
 import android.media.AudioManager
+import android.media.SoundPool
 import android.media.ToneGenerator
 import android.os.Binder
 import android.os.Build
@@ -75,6 +76,7 @@ class DrivingTrackingService : Service() {
     private var drivingActionState = DrivingActionState.CRUISING
     private val speedGuidanceMonitor = TargetSpeedMonitor(SPEED_TARGET_TOLERANCE_KMH)
     private val brakeApproachMonitor = BrakeApproachMonitor()
+    private val lapSuccessMonitor = LapSuccessMonitor(SPEED_TARGET_TOLERANCE_KMH)
     private var odoConfirmedAtSessionDistanceM = 0.0
 
     private val currentRoutePoints = ArrayList<GeoPoint>()
@@ -85,6 +87,10 @@ class DrivingTrackingService : Service() {
     private var noticeMessage: String? = null
 
     private var alarmTone: ToneGenerator? = null
+    private var successSoundPool: SoundPool? = null
+    private var successSoundId = 0
+    private var successSoundStreamId = 0
+    private var isSuccessSoundLoaded = false
     private var textToSpeech: TextToSpeech? = null
     private var isTextToSpeechInitializationComplete = false
     private var isTextToSpeechReady = false
@@ -199,6 +205,7 @@ class DrivingTrackingService : Service() {
         loadReferenceRoute()
         loadBrakeLine()
         loadSessionState()
+        initSuccessSound()
         initTextToSpeech()
     }
 
@@ -249,6 +256,11 @@ class DrivingTrackingService : Service() {
         textToSpeech = null
         alarmTone?.release()
         alarmTone = null
+        successSoundPool?.release()
+        successSoundPool = null
+        successSoundId = 0
+        successSoundStreamId = 0
+        isSuccessSoundLoaded = false
         mainHandler.removeCallbacksAndMessages(null)
         super.onDestroy()
     }
@@ -277,6 +289,7 @@ class DrivingTrackingService : Service() {
                 ?.takeIf { location.hasBearing() && it.isFinite() },
             currentSpeedKmh = currentSpeedKmh,
             latestRawSpeedKmh = latestRawSpeedKmh,
+            isGpsSignalStale = isGpsSignalStale,
             totalDistanceM = totalDistanceM,
             testProgressDistanceKm = testProgressDistanceKm(),
             currentOdoKm = currentOdoKmOrNull(),
@@ -351,6 +364,7 @@ class DrivingTrackingService : Service() {
         lastGateDistanceM = totalDistanceM
         wasInBrakeLineGate = false
         brakeApproachMonitor.reset()
+        lapSuccessMonitor.reset()
         stopApproachGuidanceVoice()
         if (sessionState == SessionState.Ready) {
             sessionState = SessionState.Idle
@@ -389,6 +403,7 @@ class DrivingTrackingService : Service() {
         if (sessionState != SessionState.Running) return
         sessionState = SessionState.Paused
         currentSpeedKmh = 0.0
+        lapSuccessMonitor.reset()
         stopApproachGuidanceVoice()
         stopBrakeVoicePrompt()
         stopScenarioTransitionVoice(clearPending = false)
@@ -420,6 +435,7 @@ class DrivingTrackingService : Service() {
         latestRawSpeedKmh = null
         stopApproachGuidanceVoice()
         brakeApproachMonitor.reset()
+        lapSuccessMonitor.reset()
         stopBrakeVoicePrompt()
         stopScenarioTransitionVoice(clearPending = true)
         clearSpeedGuidance(resetArming = true)
@@ -443,6 +459,7 @@ class DrivingTrackingService : Service() {
         activeScenarioStepId = null
         drivingActionState = DrivingActionState.CRUISING
         brakeApproachMonitor.reset()
+        lapSuccessMonitor.reset()
         currentRoutePoints.clear()
         sessionState = SessionState.Ready
         stopApproachGuidanceVoice()
@@ -504,6 +521,7 @@ class DrivingTrackingService : Service() {
         activeScenarioStepId = null
         drivingActionState = DrivingActionState.CRUISING
         brakeApproachMonitor.reset()
+        lapSuccessMonitor.reset()
         stopApproachGuidanceVoice()
         stopScenarioTransitionVoice(clearPending = true)
         clearSpeedGuidance(resetArming = true)
@@ -525,6 +543,7 @@ class DrivingTrackingService : Service() {
         publishNotice(message)
         sessionState = if (brakeLineLocation == null) SessionState.Idle else SessionState.Ready
         brakeApproachMonitor.reset()
+        lapSuccessMonitor.reset()
         stopApproachGuidanceVoice()
         stopScenarioTransitionVoice(clearPending = true)
         clearSpeedGuidance(resetArming = true)
@@ -650,6 +669,9 @@ class DrivingTrackingService : Service() {
                     appendCurrentRoutePoint(location)
                     updateTrackAreaState(location)
                     syncScenarioState()
+                }
+                updateLapSuccessTargetConfirmation()
+                if (acceptedDeltaM > 0.0) {
                     evaluateLap(location)
                 }
                 // A complete-stop sample adds no distance but must still end deceleration.
@@ -884,6 +906,12 @@ class DrivingTrackingService : Service() {
                 startBrakeVoicePrompt(step)
             } else {
                 drivingActionState = DrivingActionState.CRUISING
+                if (
+                    step?.driveMode == ScenarioDriveMode.CONSTANT &&
+                    lapSuccessMonitor.isTargetSpeedConfirmed
+                ) {
+                    playLapSuccessSound()
+                }
             }
         } else if (wasInBrakeLineGate && !inGate) {
             wasInBrakeLineGate = false
@@ -1062,6 +1090,7 @@ class DrivingTrackingService : Service() {
         lastGateDistanceM = totalDistanceM
         wasInBrakeLineGate = true
         brakeApproachMonitor.resetForNextLap()
+        lapSuccessMonitor.reset()
         stopApproachGuidanceVoice()
         stopBrakeVoicePrompt()
 
@@ -1213,6 +1242,7 @@ class DrivingTrackingService : Service() {
             else -> DrivingActionState.CRUISING
         }
         brakeApproachMonitor.cancelCandidate()
+        lapSuccessMonitor.reset()
         stopApproachGuidanceVoice()
         stopBrakeVoicePrompt()
         clearSpeedGuidance(resetArming = false)
@@ -1262,12 +1292,23 @@ class DrivingTrackingService : Service() {
                 }
             }
             DrivingActionState.ACCELERATING -> {
-                if (currentSpeedKmh >= step.targetSpeedKmh - SPEED_TARGET_TOLERANCE_KMH) {
+                if (lapSuccessMonitor.isTargetSpeedConfirmed) {
                     drivingActionState = DrivingActionState.WAITING_FOR_BRAKE_LINE
+                    playLapSuccessSound()
                 }
             }
             else -> Unit
         }
+    }
+
+    private fun updateLapSuccessTargetConfirmation() {
+        lapSuccessMonitor.update(
+            step = currentScenarioStep(),
+            actionState = drivingActionState,
+            currentSpeedKmh = currentSpeedKmh,
+            hasValidSpeedSample = latestRawSpeedKmh != null,
+            isGpsSignalStale = isGpsSignalStale
+        )
     }
 
     private fun hasReachedDecelerationTarget(targetKmh: Int): Boolean {
@@ -1753,6 +1794,39 @@ class DrivingTrackingService : Service() {
         } else {
             "시속 ${targetKmh}킬로미터까지 감속하세요."
         }
+    }
+
+    private fun initSuccessSound() {
+        val audioAttributes = AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE)
+            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+            .build()
+        val pool = SoundPool.Builder()
+            .setMaxStreams(1)
+            .setAudioAttributes(audioAttributes)
+            .build()
+        successSoundPool = pool
+        pool.setOnLoadCompleteListener { _, sampleId, status ->
+            successSoundId = sampleId
+            isSuccessSoundLoaded = status == 0
+        }
+        successSoundId = pool.load(this, R.raw.correct, 1)
+    }
+
+    private fun playLapSuccessSound() {
+        val pool = successSoundPool ?: return
+        if (!isSuccessSoundLoaded || successSoundId == 0) return
+        if (successSoundStreamId != 0) {
+            pool.stop(successSoundStreamId)
+        }
+        successSoundStreamId = pool.play(
+            successSoundId,
+            1.0f,
+            1.0f,
+            1,
+            0,
+            1.0f
+        )
     }
 
     private fun playFallbackAlarmTone() {
