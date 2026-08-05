@@ -59,12 +59,14 @@ class DrivingTrackingService : Service() {
     private var selectedPowertrain: PowertrainType? = null
     private var selectedStartOdo = ""
     private var selectedTrackOdo = ""
+    private var distanceCorrectionTenthsPercent = 0
 
     private var currentLocation: Location? = null
     private var previousLocationUpdateMs = 0L
     private var distanceAnchorLocation: Location? = null
     private var distanceAnchorReceivedAtMs = 0L
     private var totalDistanceM = 0.0
+    private var correctedDistanceM = 0.0
     private var lastGateDistanceM = 0.0
     private var wasInBrakeLineGate = false
     private var currentSpeedKmh = 0.0
@@ -291,6 +293,8 @@ class DrivingTrackingService : Service() {
             latestRawSpeedKmh = latestRawSpeedKmh,
             isGpsSignalStale = isGpsSignalStale,
             totalDistanceM = totalDistanceM,
+            correctedDistanceM = correctedDistanceM,
+            distanceCorrectionTenthsPercent = distanceCorrectionTenthsPercent,
             testProgressDistanceKm = testProgressDistanceKm(),
             currentOdoKm = currentOdoKmOrNull(),
             odoConfirmedAtSessionDistanceM = odoConfirmedAtSessionDistanceM,
@@ -390,13 +394,42 @@ class DrivingTrackingService : Service() {
 
         selectedStartOdo = startOdoText
         selectedTrackOdo = currentOdoText
-        odoConfirmedAtSessionDistanceM = totalDistanceM
+        odoConfirmedAtSessionDistanceM = correctedDistanceM
         activeScenarioStepId = null
         syncScenarioState()
         persistSessionState(force = true)
         notifyListeners()
         updateForegroundNotification(force = true)
         return TrackingCommandResult(true, "ODO가 저장되었습니다.")
+    }
+
+    fun adjustDistanceCorrection(stepTenthsPercent: Int): TrackingCommandResult {
+        if (stepTenthsPercent != -DistanceCorrectionRules.STEP_TENTHS_PERCENT &&
+            stepTenthsPercent != DistanceCorrectionRules.STEP_TENTHS_PERCENT
+        ) {
+            return TrackingCommandResult(false, "거리 보정은 0.1% 단위로 조정할 수 있습니다.")
+        }
+        val canAdjust = when (sessionState) {
+            SessionState.Idle, SessionState.Ready, SessionState.Paused -> true
+            SessionState.Running, SessionState.Finished -> false
+        }
+        if (!canAdjust) {
+            return TrackingCommandResult(false, "주행 대기 또는 일시정지 상태에서 조정하세요.")
+        }
+
+        val adjusted = DistanceCorrectionRules.adjust(
+            currentTenthsPercent = distanceCorrectionTenthsPercent,
+            step = stepTenthsPercent
+        )
+        if (adjusted == distanceCorrectionTenthsPercent) {
+            return TrackingCommandResult(false, "거리 보정 허용 범위에 도달했습니다.")
+        }
+
+        distanceCorrectionTenthsPercent = adjusted
+        persistSessionState(force = true)
+        notifyListeners()
+        updateForegroundNotification(force = true)
+        return TrackingCommandResult(true)
     }
 
     fun pauseSession() {
@@ -451,6 +484,7 @@ class DrivingTrackingService : Service() {
     fun resetToReady() {
         clearDistanceAnchor()
         totalDistanceM = 0.0
+        correctedDistanceM = 0.0
         lastGateDistanceM = 0.0
         wasInBrakeLineGate = false
         currentSpeedKmh = 0.0
@@ -514,6 +548,7 @@ class DrivingTrackingService : Service() {
         if (brakeLineLocation == null) applyBrakeLine(now)
 
         totalDistanceM = 0.0
+        correctedDistanceM = 0.0
         lastGateDistanceM = 0.0
         currentSpeedKmh = 0.0
         latestRawSpeedKmh = null
@@ -663,6 +698,10 @@ class DrivingTrackingService : Service() {
 
             if (isSessionActive() && acceptedDeltaM > 0.0) {
                 totalDistanceM += acceptedDeltaM
+                correctedDistanceM += DistanceCorrectionRules.correctedDistanceM(
+                    rawDistanceM = acceptedDeltaM,
+                    correctionTenthsPercent = distanceCorrectionTenthsPercent
+                )
             }
             if (sessionState == SessionState.Running) {
                 if (acceptedDeltaM > 0.0) {
@@ -1108,6 +1147,7 @@ class DrivingTrackingService : Service() {
 
         sessionState = SessionState.Ready
         totalDistanceM = 0.0
+        correctedDistanceM = 0.0
         lastGateDistanceM = 0.0
         currentSpeedKmh = 0.0
         latestRawSpeedKmh = null
@@ -1205,16 +1245,16 @@ class DrivingTrackingService : Service() {
 
     private fun testProgressDistanceKm(): Double {
         val gpsDistanceSinceOdoConfirmationKm =
-            max(0.0, totalDistanceM - odoConfirmedAtSessionDistanceM) / 1000.0
+            max(0.0, correctedDistanceM - odoConfirmedAtSessionDistanceM) / 1000.0
         return confirmedOdoProgressKmOrNull()?.plus(gpsDistanceSinceOdoConfirmationKm)
-            ?: (totalDistanceM / 1000.0)
+            ?: (correctedDistanceM / 1000.0)
     }
 
     private fun currentOdoKmOrNull(): Double? {
         val confirmedOdo = selectedTrackOdo.ifEmpty { selectedStartOdo }.toDoubleOrNull()
         return OdometerRules.currentOdoKm(
             confirmedOdoKm = confirmedOdo,
-            trackedDistanceM = totalDistanceM,
+            trackedDistanceM = correctedDistanceM,
             confirmationDistanceM = odoConfirmedAtSessionDistanceM
         )
     }
@@ -2057,7 +2097,17 @@ class DrivingTrackingService : Service() {
             ?.let { runCatching { PowertrainType.valueOf(it) }.getOrNull() }
         selectedStartOdo = preferences.getString(KEY_START_ODO, "").orEmpty()
         selectedTrackOdo = preferences.getString(KEY_TRACK_ODO, "").orEmpty()
-        totalDistanceM = preferences.getString(KEY_TOTAL_DISTANCE_M, null)?.toDoubleOrNull() ?: 0.0
+        totalDistanceM = preferences.getString(KEY_TOTAL_DISTANCE_M, null)
+            ?.toDoubleOrNull()
+            ?.takeIf { it.isFinite() && it >= 0.0 }
+            ?: 0.0
+        correctedDistanceM = preferences.getString(KEY_CORRECTED_DISTANCE_M, null)
+            ?.toDoubleOrNull()
+            ?.takeIf { it.isFinite() && it >= 0.0 }
+            ?: totalDistanceM
+        distanceCorrectionTenthsPercent = DistanceCorrectionRules.normalize(
+            preferences.getInt(KEY_DISTANCE_CORRECTION_TENTHS_PERCENT, 0)
+        )
         lastGateDistanceM =
             preferences.getString(KEY_LAST_GATE_DISTANCE_M, null)?.toDoubleOrNull() ?: 0.0
         wasInBrakeLineGate = preferences.getBoolean(KEY_WAS_IN_BRAKE_GATE, false)
@@ -2095,6 +2145,11 @@ class DrivingTrackingService : Service() {
             .putString(KEY_START_ODO, selectedStartOdo)
             .putString(KEY_TRACK_ODO, selectedTrackOdo)
             .putString(KEY_TOTAL_DISTANCE_M, totalDistanceM.toString())
+            .putString(KEY_CORRECTED_DISTANCE_M, correctedDistanceM.toString())
+            .putInt(
+                KEY_DISTANCE_CORRECTION_TENTHS_PERCENT,
+                distanceCorrectionTenthsPercent
+            )
             .putString(KEY_LAST_GATE_DISTANCE_M, lastGateDistanceM.toString())
             .putBoolean(KEY_WAS_IN_BRAKE_GATE, wasInBrakeLineGate)
             .putString(KEY_ODO_CONFIRMATION_DISTANCE_M, odoConfirmedAtSessionDistanceM.toString())
@@ -2145,6 +2200,9 @@ class DrivingTrackingService : Service() {
         private const val KEY_START_ODO = "tracking_start_odo"
         private const val KEY_TRACK_ODO = "tracking_track_odo"
         private const val KEY_TOTAL_DISTANCE_M = "tracking_total_distance_m"
+        private const val KEY_CORRECTED_DISTANCE_M = "tracking_corrected_distance_m"
+        private const val KEY_DISTANCE_CORRECTION_TENTHS_PERCENT =
+            "tracking_distance_correction_tenths_percent"
         private const val KEY_LAST_GATE_DISTANCE_M = "tracking_last_gate_distance_m"
         private const val KEY_WAS_IN_BRAKE_GATE = "tracking_was_in_brake_gate"
         private const val KEY_ODO_CONFIRMATION_DISTANCE_M =

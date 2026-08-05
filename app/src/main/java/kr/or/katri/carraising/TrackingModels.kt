@@ -44,6 +44,8 @@ data class TrackingSnapshot(
     val latestRawSpeedKmh: Double?,
     val isGpsSignalStale: Boolean,
     val totalDistanceM: Double,
+    val correctedDistanceM: Double,
+    val distanceCorrectionTenthsPercent: Int,
     val testProgressDistanceKm: Double,
     val currentOdoKm: Double?,
     val odoConfirmedAtSessionDistanceM: Double,

@@ -71,7 +71,8 @@ class MainActivity : Activity() {
 
     private var currentLocation: Location? = null
 
-    private var totalDistanceM = 0.0
+    private var correctedDistanceM = 0.0
+    private var distanceCorrectionTenthsPercent = 0
     private var currentSpeedKmh = 0.0
     private var isGpsSignalStale = false
     private var insideTrackArea = true
@@ -106,11 +107,16 @@ class MainActivity : Activity() {
     private var tvScenarioProgress: TextView? = null
     private var tvScenarioTarget: TextView? = null
     private var tvScenarioInstruction: TextView? = null
+    private var tvDistanceCorrectionPercent: TextView? = null
+    private var tvDistanceCorrectionFactor: TextView? = null
+    private var tvDistanceCorrectionPreview: TextView? = null
     private var trackStatusBar: View? = null
     private var alertFlashOverlay: View? = null
 
     private var btnSetBrakeLine: Button? = null
     private var btnClearBrakeLine: Button? = null
+    private var btnDecreaseDistanceCorrection: Button? = null
+    private var btnIncreaseDistanceCorrection: Button? = null
     private var btnStartPause: Button? = null
     private var btnStop: Button? = null
 
@@ -251,7 +257,8 @@ class MainActivity : Activity() {
                 }
             }
         }
-        totalDistanceM = snapshot.totalDistanceM
+        correctedDistanceM = snapshot.correctedDistanceM
+        distanceCorrectionTenthsPercent = snapshot.distanceCorrectionTenthsPercent
         currentSpeedKmh = snapshot.currentSpeedKmh
         isGpsSignalStale = snapshot.isGpsSignalStale
         insideTrackArea = snapshot.insideTrackArea
@@ -435,9 +442,9 @@ class MainActivity : Activity() {
 
     private fun testProgressDistanceKm(): Double {
         val gpsDistanceSinceOdoConfirmationKm =
-            max(0.0, totalDistanceM - odoConfirmedAtSessionDistanceM) / 1000.0
+            max(0.0, correctedDistanceM - odoConfirmedAtSessionDistanceM) / 1000.0
         return confirmedOdoProgressKmOrNull()?.plus(gpsDistanceSinceOdoConfirmationKm)
-            ?: (totalDistanceM / 1000.0)
+            ?: (correctedDistanceM / 1000.0)
     }
 
     private fun currentScenarioStep(): DrivingScenarioStep? {
@@ -896,6 +903,64 @@ class MainActivity : Activity() {
             )
         )
 
+        tvDistanceCorrectionPercent = TextView(this).apply {
+            textSize = 14f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(ScreenColors.Text)
+        }
+        tvDistanceCorrectionFactor = summaryText("").apply {
+            textSize = 11f
+        }
+        tvDistanceCorrectionPreview = summaryText("").apply {
+            textSize = 11f
+        }
+        btnDecreaseDistanceCorrection = secondaryButton("−") {
+            adjustDistanceCorrection(-DistanceCorrectionRules.STEP_TENTHS_PERCENT)
+        }.apply {
+            textSize = 24f
+            minWidth = 0
+            minimumWidth = 0
+            setPadding(0, 0, 0, 0)
+            contentDescription = "거리 보정 0.1% 감소"
+        }
+        btnIncreaseDistanceCorrection = secondaryButton("+") {
+            adjustDistanceCorrection(DistanceCorrectionRules.STEP_TENTHS_PERCENT)
+        }.apply {
+            textSize = 24f
+            minWidth = 0
+            minimumWidth = 0
+            setPadding(0, 0, 0, 0)
+            contentDescription = "거리 보정 0.1% 증가"
+        }
+        content.addView(
+            cardContainer().apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                background = trackSurfaceBackground()
+                setPadding(dp(12), dp(8), dp(12), dp(8))
+                addView(
+                    LinearLayout(this@MainActivity).apply {
+                        orientation = LinearLayout.VERTICAL
+                        gravity = Gravity.CENTER_VERTICAL
+                        addView(tvDistanceCorrectionPercent!!)
+                        addView(tvDistanceCorrectionFactor!!)
+                        addView(tvDistanceCorrectionPreview!!)
+                    },
+                    LinearLayout.LayoutParams(0, dp(54), 1f)
+                )
+                addView(
+                    btnDecreaseDistanceCorrection!!,
+                    LinearLayout.LayoutParams(dp(44), dp(44)).apply {
+                        rightMargin = dp(6)
+                    }
+                )
+                addView(
+                    btnIncreaseDistanceCorrection!!,
+                    LinearLayout.LayoutParams(dp(44), dp(44))
+                )
+            }
+        )
+
         content.addView(sectionTitle("현재 시나리오"))
         tvScenarioSection = metricTextView("A-1 · 정속")
         tvScenarioProgress = summaryText("0.0~100.0km · 전환까지 100.0km")
@@ -1202,6 +1267,18 @@ class MainActivity : Activity() {
         trackingService?.resumeSession()
     }
 
+    private fun adjustDistanceCorrection(stepTenthsPercent: Int) {
+        val result = trackingService?.adjustDistanceCorrection(stepTenthsPercent)
+            ?: TrackingCommandResult(false, "주행 서비스에 연결 중입니다.")
+        if (!result.success) {
+            Toast.makeText(
+                this,
+                result.message ?: "거리 보정값을 변경할 수 없습니다.",
+                Toast.LENGTH_SHORT
+            ).show()
+        }
+    }
+
     private fun stopSession() {
         trackingService?.stopSession()
         Toast.makeText(this, "주행 시험이 종료되었습니다.", Toast.LENGTH_SHORT).show()
@@ -1280,6 +1357,7 @@ class MainActivity : Activity() {
 
     private fun updateTrackUi() {
         updateTrackStatusBar()
+        updateDistanceCorrectionUi()
         if (sessionState != SessionState.Running) {
             stopAlertFlashLoop()
         }
@@ -1359,6 +1437,48 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun updateDistanceCorrectionUi() {
+        val correctionTenthsPercent = DistanceCorrectionRules.normalize(
+            distanceCorrectionTenthsPercent
+        )
+        val correctionPercent = DistanceCorrectionRules.percent(correctionTenthsPercent)
+        val correctionLabel = if (correctionPercent > 0.0) {
+            String.format(Locale.US, "+%.1f%%", correctionPercent)
+        } else {
+            String.format(Locale.US, "%.1f%%", correctionPercent)
+        }
+        val factor = DistanceCorrectionRules.factor(correctionTenthsPercent)
+        val previewDistanceKm = DistanceCorrectionRules.correctedDistanceM(
+            rawDistanceM = 100_000.0,
+            correctionTenthsPercent = correctionTenthsPercent
+        ) / 1000.0
+
+        tvDistanceCorrectionPercent?.text = "거리 보정 $correctionLabel"
+        tvDistanceCorrectionFactor?.text = String.format(
+            Locale.US,
+            "Factor %.4f",
+            factor
+        )
+        tvDistanceCorrectionPreview?.text = String.format(
+            Locale.US,
+            "GPS 100.0km → ODO %.1fkm",
+            previewDistanceKm
+        )
+
+        val canAdjust = trackingService != null && when (sessionState) {
+            SessionState.Idle, SessionState.Ready, SessionState.Paused -> true
+            SessionState.Running, SessionState.Finished -> false
+        }
+        val canDecrease = canAdjust &&
+            correctionTenthsPercent > DistanceCorrectionRules.MIN_TENTHS_PERCENT
+        val canIncrease = canAdjust &&
+            correctionTenthsPercent < DistanceCorrectionRules.MAX_TENTHS_PERCENT
+        btnDecreaseDistanceCorrection?.isEnabled = canDecrease
+        btnDecreaseDistanceCorrection?.alpha = if (canDecrease) 1f else 0.45f
+        btnIncreaseDistanceCorrection?.isEnabled = canIncrease
+        btnIncreaseDistanceCorrection?.alpha = if (canIncrease) 1f else 0.45f
+    }
+
     private fun updateTrackStatusBar() {
         if (currentScreen != Screen.Track) return
         val state = TrackStatusBarRules.resolve(
@@ -1398,7 +1518,7 @@ class MainActivity : Activity() {
         val confirmedOdo = selectedTrackOdo.ifEmpty { selectedStartOdo }.toDoubleOrNull()
         return OdometerRules.currentOdoKm(
             confirmedOdoKm = confirmedOdo,
-            trackedDistanceM = totalDistanceM,
+            trackedDistanceM = correctedDistanceM,
             confirmationDistanceM = odoConfirmedAtSessionDistanceM
         )
     }
