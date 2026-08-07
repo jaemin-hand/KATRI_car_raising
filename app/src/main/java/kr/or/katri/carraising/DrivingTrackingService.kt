@@ -69,6 +69,7 @@ class DrivingTrackingService : Service() {
     private var correctedDistanceM = 0.0
     private var lastGateDistanceM = 0.0
     private var wasInBrakeLineGate = false
+    private var isInitialBrakeLinePassPending = false
     private var currentSpeedKmh = 0.0
     private var latestRawSpeedKmh: Double? = null
     private var hasStationaryEvidenceForControl = false
@@ -367,6 +368,7 @@ class DrivingTrackingService : Service() {
         brakeLineLocation = null
         lastGateDistanceM = totalDistanceM
         wasInBrakeLineGate = false
+        isInitialBrakeLinePassPending = false
         brakeApproachMonitor.reset()
         lapSuccessMonitor.reset()
         stopApproachGuidanceVoice()
@@ -487,6 +489,7 @@ class DrivingTrackingService : Service() {
         correctedDistanceM = 0.0
         lastGateDistanceM = 0.0
         wasInBrakeLineGate = false
+        isInitialBrakeLinePassPending = false
         currentSpeedKmh = 0.0
         latestRawSpeedKmh = null
         odoConfirmedAtSessionDistanceM = 0.0
@@ -563,6 +566,7 @@ class DrivingTrackingService : Service() {
         currentRoutePoints.clear()
         appendCurrentRoutePoint(now, force = true)
         wasInBrakeLineGate = isInBrakeLineGate(now)
+        isInitialBrakeLinePassPending = !wasInBrakeLineGate
         val nowMs = SystemClock.elapsedRealtime()
         previousLocationUpdateMs = nowMs
         setDistanceAnchor(now, nowMs)
@@ -917,7 +921,8 @@ class DrivingTrackingService : Service() {
             isGpsSignalStale = isGpsSignalStale,
             traveledSinceBrakeLineM = max(0.0, totalDistanceM - lastGateDistanceM),
             remainingRouteDistanceM = remainingRouteDistanceM,
-            straightLineDistanceM = location.distanceTo(brakeLine).toDouble()
+            straightLineDistanceM = location.distanceTo(brakeLine).toDouble(),
+            isInitialBrakeLinePassPending = isInitialBrakeLinePassPending
         ) ?: return
 
         startApproachGuidanceVoice(guidance)
@@ -926,9 +931,17 @@ class DrivingTrackingService : Service() {
     private fun evaluateLap(location: Location) {
         val inGate = isInBrakeLineGate(location)
         val traveledFromLastGate = totalDistanceM - lastGateDistanceM
-        if (!wasInBrakeLineGate && inGate && traveledFromLastGate >= GPS_GATE_MIN_DISTANCE_M) {
+        if (
+            !wasInBrakeLineGate &&
+            inGate &&
+            BrakeLineGateRules.isEligible(
+                traveledSinceLastGateM = traveledFromLastGate,
+                isInitialBrakeLinePassPending = isInitialBrakeLinePassPending
+            )
+        ) {
             lastGateDistanceM = totalDistanceM
             wasInBrakeLineGate = true
+            isInitialBrakeLinePassPending = false
             brakeApproachMonitor.resetForNextLap()
             stopApproachGuidanceVoice()
             saveReferenceRouteIfReady()
@@ -961,6 +974,7 @@ class DrivingTrackingService : Service() {
         val inGate = isInBrakeLineGate(location)
         if (!wasInBrakeLineGate && inGate) {
             lastGateDistanceM = totalDistanceM
+            isInitialBrakeLinePassPending = false
         }
         wasInBrakeLineGate = inGate
     }
@@ -1128,6 +1142,7 @@ class DrivingTrackingService : Service() {
         saveBrakeLine()
         lastGateDistanceM = totalDistanceM
         wasInBrakeLineGate = true
+        isInitialBrakeLinePassPending = false
         brakeApproachMonitor.resetForNextLap()
         lapSuccessMonitor.reset()
         stopApproachGuidanceVoice()
@@ -2111,6 +2126,15 @@ class DrivingTrackingService : Service() {
         lastGateDistanceM =
             preferences.getString(KEY_LAST_GATE_DISTANCE_M, null)?.toDoubleOrNull() ?: 0.0
         wasInBrakeLineGate = preferences.getBoolean(KEY_WAS_IN_BRAKE_GATE, false)
+        isInitialBrakeLinePassPending = if (
+            preferences.contains(KEY_INITIAL_BRAKE_LINE_PASS_PENDING)
+        ) {
+            preferences.getBoolean(KEY_INITIAL_BRAKE_LINE_PASS_PENDING, false)
+        } else {
+            isSessionActive() &&
+                !wasInBrakeLineGate &&
+                totalDistanceM < BrakeLineGateRules.MINIMUM_REARM_DISTANCE_M
+        }
         odoConfirmedAtSessionDistanceM =
             preferences.getString(KEY_ODO_CONFIRMATION_DISTANCE_M, null)?.toDoubleOrNull() ?: 0.0
         activeScenarioStepId = preferences.getString(KEY_ACTIVE_SCENARIO_STEP_ID, null)
@@ -2128,6 +2152,7 @@ class DrivingTrackingService : Service() {
             sessionState = if (brakeLineLocation == null) SessionState.Idle else SessionState.Ready
         }
         if (!isSessionActive()) {
+            isInitialBrakeLinePassPending = false
             speedGuidanceMonitor.reset()
             brakeApproachMonitor.reset()
         }
@@ -2152,6 +2177,10 @@ class DrivingTrackingService : Service() {
             )
             .putString(KEY_LAST_GATE_DISTANCE_M, lastGateDistanceM.toString())
             .putBoolean(KEY_WAS_IN_BRAKE_GATE, wasInBrakeLineGate)
+            .putBoolean(
+                KEY_INITIAL_BRAKE_LINE_PASS_PENDING,
+                isInitialBrakeLinePassPending
+            )
             .putString(KEY_ODO_CONFIRMATION_DISTANCE_M, odoConfirmedAtSessionDistanceM.toString())
             .putString(KEY_ACTIVE_SCENARIO_STEP_ID, activeScenarioStepId)
             .putString(KEY_DRIVING_ACTION_STATE, drivingActionState.name)
@@ -2205,6 +2234,8 @@ class DrivingTrackingService : Service() {
             "tracking_distance_correction_tenths_percent"
         private const val KEY_LAST_GATE_DISTANCE_M = "tracking_last_gate_distance_m"
         private const val KEY_WAS_IN_BRAKE_GATE = "tracking_was_in_brake_gate"
+        private const val KEY_INITIAL_BRAKE_LINE_PASS_PENDING =
+            "tracking_initial_brake_line_pass_pending"
         private const val KEY_ODO_CONFIRMATION_DISTANCE_M =
             "tracking_odo_confirmation_distance_m"
         private const val KEY_ACTIVE_SCENARIO_STEP_ID = "tracking_active_scenario_step_id"
@@ -2214,7 +2245,6 @@ class DrivingTrackingService : Service() {
         private const val KEY_BRAKE_APPROACH_ANNOUNCED_STEP_ID =
             "tracking_brake_approach_announced_step_id"
 
-        private const val GPS_GATE_MIN_DISTANCE_M = 4_000.0
         private const val BRAKE_LINE_FALLBACK_RADIUS_M = 45.0
         private const val BRAKE_LINE_DETECTION_HALF_WIDTH_M = 25.0
         private const val BRAKE_LINE_HALF_LENGTH_M = 60.0

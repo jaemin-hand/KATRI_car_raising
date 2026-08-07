@@ -131,7 +131,7 @@ internal object BrakeApproachGuidanceRules {
 }
 
 internal class BrakeApproachMonitor(
-    private val minimumLapTravelDistanceM: Double = 4_000.0,
+    private val minimumLapTravelDistanceM: Double = BrakeLineGateRules.MINIMUM_REARM_DISTANCE_M,
     private val requiredConsecutiveSamples: Int = 2
 ) {
     var announcedStepId: String? = null
@@ -171,7 +171,8 @@ internal class BrakeApproachMonitor(
         isGpsSignalStale: Boolean,
         traveledSinceBrakeLineM: Double,
         remainingRouteDistanceM: Double?,
-        straightLineDistanceM: Double?
+        straightLineDistanceM: Double?,
+        isInitialBrakeLinePassPending: Boolean = false
     ): BrakeApproachGuidance? {
         if (
             sessionState != SessionState.Running ||
@@ -180,7 +181,11 @@ internal class BrakeApproachMonitor(
             isGpsSignalStale ||
             !currentSpeedKmh.isFinite() ||
             currentSpeedKmh < MINIMUM_GUIDANCE_SPEED_KMH ||
-            traveledSinceBrakeLineM < minimumLapTravelDistanceM ||
+            !BrakeLineGateRules.isEligible(
+                traveledSinceLastGateM = traveledSinceBrakeLineM,
+                isInitialBrakeLinePassPending = isInitialBrakeLinePassPending,
+                minimumRearmDistanceM = minimumLapTravelDistanceM
+            ) ||
             announcedStepId == step.id ||
             !isEligibleAction(step, actionState)
         ) {

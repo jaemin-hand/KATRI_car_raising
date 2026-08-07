@@ -195,6 +195,27 @@ class BrakeApproachGuidanceTest {
     }
 
     @Test
+    fun initialEntryAllowsBrakePreparationBeforeAFullLap() {
+        val step = KatriDrivingScenario.stepAt(150.0, PowertrainType.COMBUSTION)!!
+        val monitor = BrakeApproachMonitor(requiredConsecutiveSamples = 1)
+
+        val guidance = monitor.update(
+            sessionState = SessionState.Running,
+            step = step,
+            actionState = DrivingActionState.WAITING_FOR_BRAKE_LINE,
+            currentSpeedKmh = 60.0,
+            hasValidSpeedSample = true,
+            isGpsSignalStale = false,
+            traveledSinceBrakeLineM = 2_400.0,
+            remainingRouteDistanceM = 120.0,
+            straightLineDistanceM = 125.0,
+            isInitialBrakeLinePassPending = true
+        )
+
+        assertEquals(BrakeApproachGuidanceType.PREPARE_TO_DECELERATE, guidance?.type)
+    }
+
+    @Test
     fun routeDistanceFollowsTheRecordedDrivingDirection() {
         val route = listOf(
             GeoPoint(0.0, 0.0),
